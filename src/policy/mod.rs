@@ -1,4 +1,7 @@
+use std::collections::HashSet;
+
 use crate::{
+    core,
     config::RuleMode,
     types::{
         AppState, AttackClass, DecisionOutcome, Finding, MitigationAction, Recommendation,
@@ -8,7 +11,7 @@ use crate::{
 
 pub fn evaluate_findings(
     state: &AppState,
-    _context: &RequestContext,
+    context: &RequestContext,
     findings: Vec<Finding>,
 ) -> SecurityDecision {
     if findings.is_empty() {
@@ -18,8 +21,12 @@ pub fn evaluate_findings(
             recommendations: vec![],
             findings,
             summary: "request allowed".into(),
+            risk_score: 0.0,
         };
     }
+
+    let reputation = state.mitigation_store.get_reputation(context.source_ip);
+    let risk_score = core::calculate_risk(&findings, reputation.suspicious_score);
 
     let mut actions = Vec::new();
     let mut recommendations = Vec::new();
@@ -27,10 +34,7 @@ pub fn evaluate_findings(
 
     for finding in &findings {
         match finding.mode {
-            RuleMode::DetectOnly => {
-                recommendations.push(recommend_for_finding(finding));
-            }
-            RuleMode::Recommend => {
+            RuleMode::DetectOnly | RuleMode::Recommend => {
                 recommendations.push(recommend_for_finding(finding));
             }
             RuleMode::Block => {
@@ -40,6 +44,13 @@ pub fn evaluate_findings(
                 }
             }
         }
+    }
+
+    dedupe_actions(&mut actions);
+    dedupe_recommendations(&mut recommendations);
+
+    if risk_score >= 20.0 && findings.iter().any(|f| matches!(f.severity, Severity::Critical)) {
+        should_reject = true;
     }
 
     let outcome = if should_reject {
@@ -57,10 +68,11 @@ pub fn evaluate_findings(
         recommendations,
         findings,
         summary: if should_reject {
-            "blocking rule mode triggered request rejection".into()
+            format!("request rejected (risk_score={risk_score:.2})")
         } else {
-            "findings recorded without blocking".into()
+            format!("findings recorded without blocking (risk_score={risk_score:.2})")
         },
+        risk_score,
     }
 }
 
@@ -76,13 +88,19 @@ fn apply_block_actions(
         | AttackClass::HeaderInjection
         | AttackClass::PathTraversal
         | AttackClass::Xss
-        | AttackClass::BrokenAuthentication => {
+        | AttackClass::BrokenAuthentication
+        | AttackClass::JwtAbuse
+        | AttackClass::SchemaViolation
+        | AttackClass::TenantBoundaryViolation => {
             actions.push(MitigationAction::BlockRequest);
             actions.push(MitigationAction::MarkSourceSuspicious {
                 ttl_secs: state.config.security.temp_suspicious_secs,
             });
         }
-        AttackClass::BruteForce | AttackClass::RateLimitExceeded => {
+        AttackClass::BruteForce
+        | AttackClass::RateLimitExceeded
+        | AttackClass::BehaviorAnomaly
+        | AttackClass::ObjectEnumeration => {
             actions.push(MitigationAction::ThrottleSource {
                 ttl_secs: state.config.security.temp_suspicious_secs,
             });
@@ -95,7 +113,11 @@ fn apply_block_actions(
         AttackClass::MethodAbuse => {
             actions.push(MitigationAction::BlockRequest);
         }
-        AttackClass::Ssrf | AttackClass::RequestSmuggling | AttackClass::MissingSecurityHeaders => {
+        AttackClass::Ssrf
+        | AttackClass::RequestSmuggling
+        | AttackClass::MissingSecurityHeaders
+        | AttackClass::ResponseLeak
+        | AttackClass::ShadowApi => {
             recommendations.push(recommend_for_finding(finding));
         }
     }
@@ -107,15 +129,38 @@ fn apply_block_actions(
     }
 }
 
+fn dedupe_actions(actions: &mut Vec<MitigationAction>) {
+    let mut seen = HashSet::new();
+    actions.retain(|action| seen.insert(action_key(action)));
+}
+
+fn action_key(action: &MitigationAction) -> String {
+    match action {
+        MitigationAction::BlockRequest => "BlockRequest".to_string(),
+        MitigationAction::BlockSourceIpTemporary { ttl_secs } => {
+            format!("BlockSourceIpTemporary:{ttl_secs}")
+        }
+        MitigationAction::ThrottleSource { ttl_secs } => {
+            format!("ThrottleSource:{ttl_secs}")
+        }
+        MitigationAction::MarkSourceSuspicious { ttl_secs } => {
+            format!("MarkSourceSuspicious:{ttl_secs}")
+        }
+    }
+}
+
+fn dedupe_recommendations(recommendations: &mut Vec<Recommendation>) {
+    let mut seen = HashSet::new();
+    recommendations.retain(|rec| seen.insert(rec.action_key.clone()));
+}
+
 fn recommend_for_finding(finding: &Finding) -> Recommendation {
     match finding.attack_class {
         AttackClass::SqlInjection => Recommendation {
             action_key: "review_input_validation".into(),
             title: "Review input validation and parameterization".into(),
-            rationale: "SQL injection indicators suggest unsafe query construction or weak validation."
-                .into(),
-            risk: "Automatic permanent blocking can affect legitimate researchers or false positives."
-                .into(),
+            rationale: "SQL injection indicators suggest unsafe query construction or weak validation.".into(),
+            risk: "Automatic permanent blocking can affect legitimate researchers or false positives.".into(),
             rollback_hint: "Use temporary controls first, then tune rule scope.".into(),
             parameters: Default::default(),
         },
@@ -130,10 +175,8 @@ fn recommend_for_finding(finding: &Finding) -> Recommendation {
         AttackClass::CommandInjection => Recommendation {
             action_key: "isolate_command_surfaces".into(),
             title: "Review command execution surfaces".into(),
-            rationale: "Command execution patterns are high risk and should be isolated or removed."
-                .into(),
-            risk: "Automatic response is usually safe, but root cause still requires manual review."
-                .into(),
+            rationale: "Command execution patterns are high risk and should be isolated or removed.".into(),
+            risk: "Automatic response is usually safe, but root cause still requires manual review.".into(),
             rollback_hint: "Restore route after validation hardening and test coverage.".into(),
             parameters: Default::default(),
         },
@@ -169,18 +212,18 @@ fn recommend_for_finding(finding: &Finding) -> Recommendation {
             rollback_hint: "Roll back per-route after allowlist tuning.".into(),
             parameters: Default::default(),
         },
-        AttackClass::BrokenAuthentication => Recommendation {
+        AttackClass::BrokenAuthentication | AttackClass::JwtAbuse => Recommendation {
             action_key: "review_auth_policy".into(),
             title: "Review auth policy for protected path".into(),
-            rationale: "Protected route was accessed without valid API credentials.".into(),
+            rationale: "Protected route was accessed without valid credentials or token constraints.".into(),
             risk: "Automatic blocking is usually safe on admin or internal routes.".into(),
-            rollback_hint: "Adjust protected path configuration or key rotation.".into(),
+            rollback_hint: "Adjust protected path configuration or token validation policy.".into(),
             parameters: Default::default(),
         },
-        AttackClass::BruteForce | AttackClass::RateLimitExceeded => Recommendation {
+        AttackClass::BruteForce | AttackClass::RateLimitExceeded | AttackClass::BehaviorAnomaly => Recommendation {
             action_key: "enable_progressive_delay".into(),
             title: "Enable progressive delay or stricter throttling".into(),
-            rationale: "Burst activity suggests brute-force or abuse pressure.".into(),
+            rationale: "Burst or anomalous activity suggests brute-force or abuse pressure.".into(),
             risk: "May increase friction for legitimate heavy users behind shared IPs.".into(),
             rollback_hint: "Use shorter TTLs and route-specific overrides.".into(),
             parameters: Default::default(),
@@ -188,8 +231,7 @@ fn recommend_for_finding(finding: &Finding) -> Recommendation {
         AttackClass::MethodAbuse => Recommendation {
             action_key: "disable_unused_methods".into(),
             title: "Disable unused HTTP methods".into(),
-            rationale: "Suspicious methods such as TRACE or CONNECT are rarely needed publicly."
-                .into(),
+            rationale: "Suspicious methods such as TRACE or CONNECT are rarely needed publicly.".into(),
             risk: "Can affect rare tooling or diagnostics if not scoped.".into(),
             rollback_hint: "Re-enable method only where explicitly needed.".into(),
             parameters: Default::default(),
@@ -205,10 +247,41 @@ fn recommend_for_finding(finding: &Finding) -> Recommendation {
         AttackClass::MissingSecurityHeaders => Recommendation {
             action_key: "add_security_headers".into(),
             title: "Add security headers upstream".into(),
-            rationale: "Missing headers are a hardening issue, not necessarily an active exploit."
-                .into(),
+            rationale: "Missing headers are a hardening issue, not necessarily an active exploit.".into(),
             risk: "Some headers may affect browser behavior if added broadly.".into(),
             rollback_hint: "Scope header policy to tested routes.".into(),
+            parameters: Default::default(),
+        },
+        AttackClass::SchemaViolation => Recommendation {
+            action_key: "tighten_api_schema".into(),
+            title: "Tighten API schema enforcement".into(),
+            rationale: "Schema drift or malformed requests suggest positive security gaps.".into(),
+            risk: "Blocking unknown routes too aggressively can break undocumented integrations.".into(),
+            rollback_hint: "Use detect mode first, then raise high-confidence routes to block.".into(),
+            parameters: Default::default(),
+        },
+        AttackClass::ObjectEnumeration | AttackClass::TenantBoundaryViolation => Recommendation {
+            action_key: "harden_object_authorization".into(),
+            title: "Harden object and tenant authorization".into(),
+            rationale: "Object or tenant-boundary abuse is one of the highest-impact API attack classes.".into(),
+            risk: "Route-level exceptions may be required for trusted service accounts.".into(),
+            rollback_hint: "Start with detect mode and validate route-object mapping before enforcement.".into(),
+            parameters: Default::default(),
+        },
+        AttackClass::ResponseLeak => Recommendation {
+            action_key: "inspect_response_contracts".into(),
+            title: "Inspect upstream response contracts".into(),
+            rationale: "Token, debug, or oversharing signals were detected in the response path.".into(),
+            risk: "Aggressive masking can affect clients that depend on current response shape.".into(),
+            rollback_hint: "Enable response inspection in detect mode before blocking.".into(),
+            parameters: Default::default(),
+        },
+        AttackClass::ShadowApi => Recommendation {
+            action_key: "review_shadow_routes".into(),
+            title: "Review shadow or undocumented routes".into(),
+            rationale: "Live traffic indicates routes not present in the declared API inventory.".into(),
+            risk: "Some internal or canary routes may be intentionally undocumented.".into(),
+            rollback_hint: "Whitelist validated internal routes in the spec database.".into(),
             parameters: Default::default(),
         },
     }

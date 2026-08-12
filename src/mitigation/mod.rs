@@ -6,7 +6,7 @@ use axum::{
 };
 use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -192,7 +192,7 @@ pub fn finalize_blocking_decision(
     decision: SecurityDecision,
 ) -> Response<Body> {
     let reputation_delta = calculate_reputation_delta(&decision);
-    let reputation = if reputation_delta > 0 {
+    let _reputation = if reputation_delta > 0 {
         let rep = state
             .mitigation_store
             .add_suspicious_score(context.source_ip, reputation_delta);
@@ -207,79 +207,36 @@ pub fn finalize_blocking_decision(
     };
 
     for action in &decision.actions {
-        match action {
-            MitigationAction::BlockSourceIpTemporary { ttl_secs } => {
-                let mitigation = state.mitigation_store.block_ip_for(
-                    context.source_ip,
-                    *ttl_secs,
-                    decision.summary.clone(),
-                );
-
-                if let Err(err) =
-                    storage::upsert_active_mitigation(&state.config.storage.sqlite_path, &mitigation)
-                {
-                    error!(error = %err, "failed to persist active mitigation");
-                }
-
-                warn!(
-                    request_id = %context.request_id,
-                    source_ip = %context.source_ip,
-                    action_id = %mitigation.action_id,
-                    ttl_secs = ttl_secs,
-                    "temporary IP block applied"
-                );
-            }
-            MitigationAction::MarkSourceSuspicious { .. }
-            | MitigationAction::ThrottleSource { .. }
-            | MitigationAction::BlockRequest => {}
-        }
-    }
-
-    if let Some(reputation) = reputation {
-        if reputation.suspicious_score >= state.config.security.suspicious_score_threshold {
+        if let MitigationAction::BlockSourceIpTemporary { ttl_secs } = action {
             let mitigation = state.mitigation_store.block_ip_for(
                 context.source_ip,
-                state.config.security.temp_ban_secs,
-                format!(
-                    "source exceeded suspicious score threshold ({})",
-                    reputation.suspicious_score
-                ),
+                *ttl_secs,
+                decision.summary.clone(),
             );
 
             if let Err(err) =
                 storage::upsert_active_mitigation(&state.config.storage.sqlite_path, &mitigation)
             {
-                error!(error = %err, "failed to persist threshold-based active mitigation");
+                error!(error = %err, "failed to persist active mitigation");
             }
 
             warn!(
                 request_id = %context.request_id,
                 source_ip = %context.source_ip,
                 action_id = %mitigation.action_id,
-                suspicious_score = reputation.suspicious_score,
-                "automatic block applied due to suspicious score threshold"
+                ttl_secs = ttl_secs,
+                "temporary IP block applied"
             );
         }
     }
 
     let (status, body) = match &decision.outcome {
-        DecisionOutcome::Reject {
-            status_code,
-            message,
-        } => {
+        DecisionOutcome::Reject { status_code, message } => {
             let status = StatusCode::from_u16(*status_code).unwrap_or(StatusCode::FORBIDDEN);
             (status, message.clone())
         }
         DecisionOutcome::Allow => (StatusCode::OK, "allowed".to_string()),
     };
-
-    info!(
-        request_id = %context.request_id,
-        source_ip = %context.source_ip,
-        status_code = status.as_u16(),
-        summary = %decision.summary,
-        "blocking decision finalized"
-    );
 
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
@@ -289,42 +246,6 @@ pub fn finalize_blocking_decision(
     }
 
     response
-}
-
-pub fn apply_non_blocking_effects(state: &AppState, context: &RequestContext, decision: &SecurityDecision) {
-    let delta = calculate_reputation_delta(decision);
-    if delta > 0 {
-        let reputation = state.mitigation_store.add_suspicious_score(context.source_ip, delta);
-
-        if let Err(err) = storage::upsert_reputation(&state.config.storage.sqlite_path, &reputation) {
-            error!(error = %err, "failed to persist reputation");
-        }
-
-        if reputation.suspicious_score >= state.config.security.suspicious_score_threshold {
-            let mitigation = state.mitigation_store.block_ip_for(
-                context.source_ip,
-                state.config.security.temp_ban_secs,
-                format!(
-                    "source exceeded suspicious score threshold ({})",
-                    reputation.suspicious_score
-                ),
-            );
-
-            if let Err(err) =
-                storage::upsert_active_mitigation(&state.config.storage.sqlite_path, &mitigation)
-            {
-                error!(error = %err, "failed to persist threshold-based active mitigation");
-            }
-
-            warn!(
-                request_id = %context.request_id,
-                source_ip = %context.source_ip,
-                action_id = %mitigation.action_id,
-                suspicious_score = reputation.suspicious_score,
-                "automatic block applied due to suspicious score threshold"
-            );
-        }
-    }
 }
 
 pub fn apply_manual_block(
@@ -346,6 +267,80 @@ pub fn reset_reputation_for_ip(state: &AppState, ip: IpAddr) -> anyhow::Result<b
     Ok(removed)
 }
 
+pub fn clear_source_state(state: &AppState, ip: IpAddr) -> anyhow::Result<(bool, bool)> {
+    let block_removed = state.mitigation_store.unblock_ip(ip);
+    if block_removed {
+        storage::delete_active_mitigation(&state.config.storage.sqlite_path, &ip.to_string())?;
+    }
+
+    let reputation_removed = state.mitigation_store.reset_reputation(ip);
+    if reputation_removed {
+        storage::delete_reputation(&state.config.storage.sqlite_path, &ip.to_string())?;
+    }
+
+    let _cleared_memory = state.rate_limiter.clear_source_state(ip);
+
+    Ok((block_removed, reputation_removed))
+}
+
+pub fn apply_non_blocking_effects(
+    state: &AppState,
+    context: &RequestContext,
+    decision: &SecurityDecision,
+) {
+    let reputation_delta = calculate_reputation_delta(decision);
+    if reputation_delta > 0 {
+        let rep = state
+            .mitigation_store
+            .add_suspicious_score(context.source_ip, reputation_delta);
+        if let Err(err) = storage::upsert_reputation(&state.config.storage.sqlite_path, &rep) {
+            error!(error = %err, "failed to persist reputation (non-blocking)");
+        }
+    }
+}
+
+pub fn demo_recommendations() -> Vec<Recommendation> {
+    vec![
+        Recommendation {
+            action_key: "block_ip_temporary".to_string(),
+            title: "Temporarily block suspicious source IP".to_string(),
+            rationale: "Source has exceeded suspicious score threshold.".to_string(),
+            risk: "Low — reversible action with TTL.".to_string(),
+            rollback_hint: "Use unblock endpoint to remove before TTL expires.".to_string(),
+            parameters: hashmap(vec![
+                ("source_ip".to_string(), "127.0.0.1".to_string()),
+                ("ttl_secs".to_string(), "900".to_string()),
+            ]),
+        },
+        Recommendation {
+            action_key: "reset_reputation".to_string(),
+            title: "Reset source reputation after review".to_string(),
+            rationale: "Analyst confirmed source is benign.".to_string(),
+            risk: "Low — clears accumulated score only.".to_string(),
+            rollback_hint: "Score will re-accumulate on future violations.".to_string(),
+            parameters: hashmap(vec![
+                ("source_ip".to_string(), "127.0.0.1".to_string()),
+            ]),
+        },
+    ]
+}
+
+pub fn recommendation_to_command(rec: &Recommendation) -> Option<OperatorActionCommand> {
+    let (kind, reversible) = match rec.action_key.as_str() {
+        "block_ip_temporary" => (OperatorActionKind::BlockIpTemporary, true),
+        "reset_reputation" => (OperatorActionKind::ResetReputation, false),
+        _ => return None,
+    };
+
+    Some(OperatorActionCommand {
+        kind,
+        title: rec.title.clone(),
+        rationale: rec.rationale.clone(),
+        reversible,
+        parameters: rec.parameters.clone(),
+    })
+}
+
 fn calculate_reputation_delta(decision: &SecurityDecision) -> i32 {
     let mut score = 0;
 
@@ -359,60 +354,6 @@ fn calculate_reputation_delta(decision: &SecurityDecision) -> i32 {
     }
 
     score
-}
-
-pub fn demo_recommendations() -> Vec<Recommendation> {
-    vec![
-        Recommendation {
-            action_key: "block_ip_15m".into(),
-            title: "Temporarily block source IP".into(),
-            rationale: "Use for repeated high-confidence exploit probes or brute-force bursts."
-                .into(),
-            risk: "May affect shared NAT users; keep TTL short.".into(),
-            rollback_hint: "Remove from temporary denylist or wait for expiry.".into(),
-            parameters: hashmap(vec![("ttl_secs".into(), "900".into())]),
-        },
-        Recommendation {
-            action_key: "tighten_route_rate_limit".into(),
-            title: "Tighten route-level rate limit".into(),
-            rationale: "Useful for login abuse, scraping spikes, and repeated credential attempts."
-                .into(),
-            risk: "Can increase friction for legitimate users during traffic bursts.".into(),
-            rollback_hint: "Restore previous route limit policy.".into(),
-            parameters: hashmap(vec![
-                ("route".into(), "/login".into()),
-                ("window_secs".into(), "60".into()),
-                ("requests".into(), "5".into()),
-            ]),
-        },
-    ]
-}
-
-pub fn recommendation_to_command(rec: &Recommendation) -> Option<OperatorActionCommand> {
-    match rec.action_key.as_str() {
-        "block_ip_15m" => Some(OperatorActionCommand {
-            kind: OperatorActionKind::BlockIpTemporary,
-            title: rec.title.clone(),
-            rationale: rec.rationale.clone(),
-            reversible: true,
-            parameters: rec.parameters.clone(),
-        }),
-        "tighten_route_rate_limit" => Some(OperatorActionCommand {
-            kind: OperatorActionKind::TightenRouteRateLimit,
-            title: rec.title.clone(),
-            rationale: rec.rationale.clone(),
-            reversible: true,
-            parameters: rec.parameters.clone(),
-        }),
-        "disable_unused_methods" => Some(OperatorActionCommand {
-            kind: OperatorActionKind::SwitchRuleMode,
-            title: rec.title.clone(),
-            rationale: rec.rationale.clone(),
-            reversible: true,
-            parameters: rec.parameters.clone(),
-        }),
-        _ => None,
-    }
 }
 
 fn hashmap(entries: Vec<(String, String)>) -> HashMap<String, String> {

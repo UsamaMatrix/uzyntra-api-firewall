@@ -9,4 +9,5 @@ pub mod proxy;
 pub mod rate_limit;
 pub mod storage;
 pub mod telemetry;
+pub mod telemetry_delivery;
 pub mod types;

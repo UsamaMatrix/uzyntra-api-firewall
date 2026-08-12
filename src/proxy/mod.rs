@@ -6,7 +6,8 @@ use axum::{
 use tracing::{error, info};
 
 use crate::{
-    policy, storage, telemetry,
+    detection, policy, rate_limit, storage, telemetry,
+    mitigation,
     types::{
         AppState, AttackClass, Finding, FindingEvidence, RequestContext, SecurityEvent, Severity,
     },
@@ -17,11 +18,104 @@ pub async fn proxy_handler(
     Path(path): Path<String>,
     request: Request<Body>,
 ) -> Response<Body> {
-    let context = request.extensions().get::<RequestContext>().cloned();
+    let Some(context) = request.extensions().get::<RequestContext>().cloned() else {
+        return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, "request context missing");
+    };
 
     let method = request.method().clone();
     let query = request.uri().query().map(ToOwned::to_owned);
     let headers = request.headers().clone();
+
+    let mut request_findings = detection::inspect_request(&state, &context, &headers);
+request_findings.extend(rate_limit::evaluate_request_with_headers(
+    &state,
+    &context,
+    &headers,
+));
+
+    let principal_key = crate::core::derive_principal(&state, &context, &headers)
+        .as_rate_limit_key();
+    let trusted_source = crate::core::is_source_allowlisted(&state, &context.source_ip.to_string())
+        || crate::core::is_source_allowlisted_for_path(&state, &context.source_ip.to_string(), &context.path);
+    let trusted_principal = crate::core::is_principal_allowlisted(&state, &principal_key)
+        || crate::core::is_principal_allowlisted_for_path(&state, &principal_key, &context.path);
+
+    let trusted_tri_scoped = crate::core::is_tri_scoped_allowlisted(
+        &state,
+        &context.source_ip.to_string(),
+        &principal_key,
+        &context.path,
+    );
+    let trusted_source = trusted_source || trusted_tri_scoped;
+    let trusted_principal = trusted_principal || trusted_tri_scoped;
+
+    if trusted_source || trusted_principal {
+        tracing::info!(
+            request_id = %context.request_id,
+            source_ip = %context.source_ip,
+            principal = %principal_key,
+            trusted_source,
+            trusted_principal,
+            "request matched allowlist; bypassing enforcement"
+        );
+    }
+
+    let shadow_routes = crate::core::discover_shadow_apis(&state);
+    if shadow_routes
+        .iter()
+        .any(|r| r.method.eq_ignore_ascii_case(&context.method) && r.normalized_path
+    == crate::core::normalize_runtime_path(&crate::core::canonical_security_path(&context.path)))
+    {
+        request_findings.push(Finding {
+            rule_id: "shadow.route_live".to_string(),
+            attack_class: AttackClass::ShadowApi,
+            severity: Severity::Medium,
+            confidence: 0.80,
+            message: "request matched a learned live route that is outside the configured spec".to_string(),
+            evidence: vec![FindingEvidence {
+                location: "request.path".to_string(),
+                value_preview: context.path.clone(),
+            }],
+            mode: crate::types::resolve_rule_mode(&state, &context.path, "shadow.route_live"),
+        });
+    }
+
+    let request_findings = if trusted_source || trusted_principal {
+        Vec::new()
+    } else {
+        crate::core::filter_suppressed_findings(&state, &context.path, request_findings)
+    };
+
+    if !request_findings.is_empty() {
+        let decision = policy::evaluate_findings(&state, &context, request_findings.clone());
+
+        let event = SecurityEvent {
+            request_id: context.request_id.clone(),
+            timestamp: context.timestamp,
+            source_ip: context.source_ip.to_string(),
+            method: context.method.clone(),
+            path: context.path.clone(),
+            findings: request_findings,
+            decision: decision.clone(),
+        };
+
+        telemetry::emit_security_event(&event, &state.config.telemetry.security_event_log_path);
+
+        if let Err(err) = storage::persist_security_event(&state.config.storage.sqlite_path, &event) {
+            error!(error = %err, "failed to persist request-side security event to SQLite");
+        }
+
+        state.telemetry_delivery.enqueue(&event);
+
+        match &decision.outcome {
+            crate::types::DecisionOutcome::Reject { .. } => {
+                return mitigation::finalize_blocking_decision(&state, &context, decision);
+            }
+            crate::types::DecisionOutcome::Allow => {
+                mitigation::apply_non_blocking_effects(&state, &context, &decision);
+            }
+        }
+    }
 
     let full_url = build_upstream_url(
         &state.config.proxy.upstream_base_url,
@@ -74,28 +168,6 @@ pub async fn proxy_handler(
     let status = upstream_response.status();
     let response_headers = upstream_response.headers().clone();
 
-    let response_findings = inspect_response_headers(&response_headers, &state, context.as_ref());
-    if !response_findings.is_empty() {
-        if let Some(ctx) = &context {
-            let decision = policy::evaluate_findings(&state, ctx, response_findings.clone());
-            let event = SecurityEvent {
-                request_id: ctx.request_id.clone(),
-                timestamp: ctx.timestamp,
-                source_ip: ctx.source_ip.to_string(),
-                method: ctx.method.clone(),
-                path: ctx.path.clone(),
-                findings: response_findings,
-                decision,
-            };
-
-            telemetry::emit_security_event(&event, &state.config.telemetry.security_event_log_path);
-
-            if let Err(err) = storage::persist_security_event(&state.config.storage.sqlite_path, &event) {
-                error!(error = %err, "failed to persist response-side security event to SQLite");
-            }
-        }
-    }
-
     let response_body = match upstream_response.bytes().await {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -103,6 +175,125 @@ pub async fn proxy_handler(
             return response_with_status(StatusCode::BAD_GATEWAY, "failed to read upstream response");
         }
     };
+
+    let preview_len = state
+        .config
+        .security
+        .max_inspection_body_bytes
+        .min(response_body.len());
+    let response_body_preview = String::from_utf8_lossy(&response_body[..preview_len]).to_string();
+
+    let mut response_findings =
+        inspect_response_headers(&response_headers, &state, Some(&context));
+
+    response_findings.extend(detection::inspect_response(
+        &state,
+        &context,
+        &response_headers,
+        &response_body_preview,
+    ));
+
+    let normalized_path = crate::core::normalize_runtime_path(
+        &crate::core::canonical_security_path(&context.path)
+    );
+
+    if let Some(contract) = crate::core::response_contract_for_route(
+        &state,
+        &context.method,
+        &normalized_path,
+    ) {
+        let status_ok = status.as_u16() == contract.expected_status;
+
+        let content_type_value = response_headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        let content_type_ok = content_type_value.starts_with(&contract.expected_content_type_prefix);
+
+        let missing_required_headers: Vec<String> = contract
+            .required_headers
+            .iter()
+            .filter(|header_name| !response_headers.contains_key(header_name.as_str()))
+            .cloned()
+            .collect();
+
+        if !status_ok || !content_type_ok || !missing_required_headers.is_empty() {
+            response_findings.push(crate::types::Finding {
+                rule_id: "response.contract_mismatch".to_string(),
+                attack_class: crate::types::AttackClass::ResponseLeak,
+                severity: crate::types::Severity::Medium,
+                confidence: 0.88,
+                message: format!(
+                    "response contract mismatch for {} {}",
+                    context.method, normalized_path
+                ),
+                evidence: vec![
+                    crate::types::FindingEvidence {
+                        location: "response.contract.status".to_string(),
+                        value_preview: format!(
+                            "expected={}, actual={}",
+                            contract.expected_status,
+                            status.as_u16()
+                        ),
+                    },
+                    crate::types::FindingEvidence {
+                        location: "response.contract.content_type".to_string(),
+                        value_preview: format!(
+                            "expected_prefix={}, actual={}",
+                            contract.expected_content_type_prefix,
+                            content_type_value
+                        ),
+                    },
+                    crate::types::FindingEvidence {
+                        location: "response.contract.missing_headers".to_string(),
+                        value_preview: missing_required_headers.join(","),
+                    },
+                ],
+                mode: crate::types::resolve_rule_mode(
+                    &state,
+                    &context.path,
+                    "response.contract_mismatch",
+                ),
+            });
+        }
+    }
+
+    let response_findings = if trusted_source || trusted_principal {
+        Vec::new()
+    } else {
+        crate::core::filter_suppressed_findings(&state, &context.path, response_findings)
+    };
+
+    if !response_findings.is_empty() {
+        let decision = policy::evaluate_findings(&state, &context, response_findings.clone());
+        let event = SecurityEvent {
+            request_id: context.request_id.clone(),
+            timestamp: context.timestamp,
+            source_ip: context.source_ip.to_string(),
+            method: context.method.clone(),
+            path: context.path.clone(),
+            findings: response_findings,
+            decision: decision.clone(),
+        };
+
+        telemetry::emit_security_event(&event, &state.config.telemetry.security_event_log_path);
+
+        if let Err(err) = storage::persist_security_event(&state.config.storage.sqlite_path, &event) {
+            error!(error = %err, "failed to persist response-side security event to SQLite");
+        }
+
+        state.telemetry_delivery.enqueue(&event);
+
+        match &decision.outcome {
+            crate::types::DecisionOutcome::Reject { .. } => {
+                return mitigation::finalize_blocking_decision(&state, &context, decision);
+            }
+            crate::types::DecisionOutcome::Allow => {
+                mitigation::apply_non_blocking_effects(&state, &context, &decision);
+            }
+        }
+    }
 
     let mut response = Response::new(Body::from(response_body));
     *response.status_mut() = status;
@@ -121,7 +312,12 @@ pub async fn proxy_handler(
             .insert(header_name, HeaderValue::from_static("true"));
     }
 
+    if let Ok(value) = HeaderValue::from_str(&context.request_id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+
     info!(
+        request_id = %context.request_id,
         method = %method,
         upstream = %full_url,
         status = %status,
