@@ -3,6 +3,7 @@ pub mod config;
 pub mod control_plane;
 pub mod core;
 pub mod detection;
+pub mod enrollment;
 pub mod mitigation;
 pub mod policy;
 pub mod proxy;

@@ -66,6 +66,21 @@ telemetry:
   log_level: "info"
   security_event_log_path: "data/security-events.jsonl"
 
+control_plane:
+  telemetry_enabled: false
+  enrollment_enabled: false
+  enrollment_url: "http://127.0.0.1:3000/api/firewalls/enroll"
+  enrollment_token: ""
+  ingestion_url: "http://127.0.0.1:3000/api/ingest/security-events"
+  api_key: ""
+  firewall_instance_id: ""
+  installation_identifier: ""
+  hostname: ""
+  version: "0.1.0"
+  region: ""
+  request_timeout_ms: 5000
+  queue_capacity: 1024
+
 storage:
   sqlite_path: "data/api_firewall.db"
 

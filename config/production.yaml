@@ -56,6 +56,13 @@ telemetry:
 
 control_plane:
   telemetry_enabled: false
+  enrollment_enabled: false
+  enrollment_url: ""
+  enrollment_token: ""
+  installation_identifier: ""
+  hostname: ""
+  version: "0.1.0"
+  region: ""
   ingestion_url: ""
   api_key: ""
   firewall_instance_id: ""

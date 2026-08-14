@@ -267,6 +267,22 @@ UZYNTRA_FIREWALL_INSTANCE_ID=<firewall-instance-id>
 
 Telemetry delivery is disabled by default. When enabled, events are queued in memory and submitted with retries; queue drops and delivery failures are exposed in admin metrics under `control_plane_telemetry`.
 
+### Control Plane Enrollment
+
+The engine can also consume a short-lived one-time enrollment token from the Next.js control plane. Enrollment activates the registered firewall instance and returns a machine API key for runtime telemetry delivery. The token is cleared from memory after successful enrollment and is never logged.
+
+```text
+UZYNTRA_CONTROL_PLANE_ENROLLMENT_ENABLED=true
+UZYNTRA_CONTROL_PLANE_ENROLLMENT_URL=http://localhost:3000/api/firewalls/enroll
+UZYNTRA_CONTROL_PLANE_ENROLLMENT_TOKEN=<one-time-enrollment-token>
+UZYNTRA_CONTROL_PLANE_INSTALLATION_IDENTIFIER=<stable-installation-id>
+UZYNTRA_CONTROL_PLANE_HOSTNAME=<hostname>
+UZYNTRA_CONTROL_PLANE_VERSION=0.1.0
+UZYNTRA_CONTROL_PLANE_REGION=<region>
+```
+
+`UZYNTRA_CONTROL_PLANE_INGEST_URL` is still required when telemetry delivery is enabled, because enrollment provides the credential and firewall id, not the ingestion endpoint location.
+
 ---
 
 ## 🧪 Testing Security

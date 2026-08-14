@@ -2,3 +2,4 @@
 data/**/*.jsonl
 data/*.db
 .env
+.pass

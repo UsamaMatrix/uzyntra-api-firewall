@@ -1,29 +1,35 @@
 use std::net::SocketAddr;
 
 use anyhow::Context;
-use api_firewall::{app, config::AppConfig, storage, telemetry};
+use api_firewall::{app, config::AppConfig, enrollment, storage, telemetry};
 use tokio::net::TcpListener;
 use tracing::info;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = AppConfig::load().context("failed to load application config")?;
+    let mut config = AppConfig::load().context("failed to load application config")?;
     telemetry::init(&config.telemetry.log_level)?;
 
-    storage::init_db(&config.storage.sqlite_path)
-        .context("failed to initialize SQLite storage")?;
+    enrollment::enroll_control_plane_if_configured(&mut config.control_plane)
+        .await
+        .context("failed to enroll with control plane")?;
 
-    let public_bind_addr: SocketAddr = config
-        .server
-        .public_bind_addr
-        .parse()
-        .with_context(|| format!("invalid public bind address: {}", config.server.public_bind_addr))?;
+    storage::init_db(&config.storage.sqlite_path).context("failed to initialize SQLite storage")?;
 
-    let admin_bind_addr: SocketAddr = config
-        .server
-        .admin_bind_addr
-        .parse()
-        .with_context(|| format!("invalid admin bind address: {}", config.server.admin_bind_addr))?;
+    let public_bind_addr: SocketAddr =
+        config.server.public_bind_addr.parse().with_context(|| {
+            format!(
+                "invalid public bind address: {}",
+                config.server.public_bind_addr
+            )
+        })?;
+
+    let admin_bind_addr: SocketAddr = config.server.admin_bind_addr.parse().with_context(|| {
+        format!(
+            "invalid admin bind address: {}",
+            config.server.admin_bind_addr
+        )
+    })?;
 
     let app_state = app::build_state(config.clone())?;
     app::hydrate_state_from_storage(&app_state)?;

@@ -79,6 +79,20 @@ pub struct ControlPlaneConfig {
     #[serde(default)]
     pub telemetry_enabled: bool,
     #[serde(default)]
+    pub enrollment_enabled: bool,
+    #[serde(default)]
+    pub enrollment_url: String,
+    #[serde(default)]
+    pub enrollment_token: String,
+    #[serde(default)]
+    pub installation_identifier: String,
+    #[serde(default)]
+    pub hostname: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub region: String,
+    #[serde(default)]
     pub ingestion_url: String,
     #[serde(default)]
     pub api_key: String,
@@ -94,6 +108,13 @@ impl Default for ControlPlaneConfig {
     fn default() -> Self {
         Self {
             telemetry_enabled: false,
+            enrollment_enabled: false,
+            enrollment_url: String::new(),
+            enrollment_token: String::new(),
+            installation_identifier: String::new(),
+            hostname: String::new(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            region: String::new(),
             ingestion_url: String::new(),
             api_key: String::new(),
             firewall_instance_id: String::new(),
@@ -105,20 +126,28 @@ impl Default for ControlPlaneConfig {
 
 impl ControlPlaneConfig {
     pub fn validate(&self) -> Result<()> {
-        if !self.telemetry_enabled {
-            return Ok(());
+        if self.enrollment_enabled {
+            if self.enrollment_url.trim().is_empty() {
+                bail!("control-plane enrollment is enabled but enrollment_url is missing");
+            }
+
+            if self.enrollment_token.trim().is_empty() {
+                bail!("control-plane enrollment is enabled but enrollment_token is missing");
+            }
         }
 
-        if self.ingestion_url.trim().is_empty() {
-            bail!("control-plane telemetry is enabled but ingestion_url is missing");
-        }
+        if self.telemetry_enabled {
+            if self.ingestion_url.trim().is_empty() {
+                bail!("control-plane telemetry is enabled but ingestion_url is missing");
+            }
 
-        if self.api_key.trim().is_empty() {
-            bail!("control-plane telemetry is enabled but api_key is missing");
-        }
+            if self.api_key.trim().is_empty() && !self.enrollment_enabled {
+                bail!("control-plane telemetry is enabled but api_key is missing");
+            }
 
-        if self.firewall_instance_id.trim().is_empty() {
-            bail!("control-plane telemetry is enabled but firewall_instance_id is missing");
+            if self.firewall_instance_id.trim().is_empty() && !self.enrollment_enabled {
+                bail!("control-plane telemetry is enabled but firewall_instance_id is missing");
+            }
         }
 
         if self.request_timeout_ms == 0 || self.request_timeout_ms > 30_000 {
@@ -451,6 +480,36 @@ impl AppConfig {
 
         if let Ok(enabled) = env::var("UZYNTRA_CONTROL_PLANE_TELEMETRY_ENABLED") {
             config.control_plane.telemetry_enabled = parse_bool_env(&enabled);
+        }
+
+        if let Ok(enabled) = env::var("UZYNTRA_CONTROL_PLANE_ENROLLMENT_ENABLED") {
+            config.control_plane.enrollment_enabled = parse_bool_env(&enabled);
+        }
+
+        if let Ok(enrollment_url) = env::var("UZYNTRA_CONTROL_PLANE_ENROLLMENT_URL") {
+            config.control_plane.enrollment_url = enrollment_url;
+        }
+
+        if let Ok(enrollment_token) = env::var("UZYNTRA_CONTROL_PLANE_ENROLLMENT_TOKEN") {
+            config.control_plane.enrollment_token = enrollment_token;
+        }
+
+        if let Ok(installation_identifier) =
+            env::var("UZYNTRA_CONTROL_PLANE_INSTALLATION_IDENTIFIER")
+        {
+            config.control_plane.installation_identifier = installation_identifier;
+        }
+
+        if let Ok(hostname) = env::var("UZYNTRA_CONTROL_PLANE_HOSTNAME") {
+            config.control_plane.hostname = hostname;
+        }
+
+        if let Ok(version) = env::var("UZYNTRA_CONTROL_PLANE_VERSION") {
+            config.control_plane.version = version;
+        }
+
+        if let Ok(region) = env::var("UZYNTRA_CONTROL_PLANE_REGION") {
+            config.control_plane.region = region;
         }
 
         if let Ok(ingestion_url) = env::var("UZYNTRA_CONTROL_PLANE_INGEST_URL") {
