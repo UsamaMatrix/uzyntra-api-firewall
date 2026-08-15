@@ -10,7 +10,10 @@ RUN cargo build --release
 FROM debian:bookworm-slim
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /app/data
 
 COPY --from=builder /app/target/release/api_firewall /usr/local/bin/api_firewall
 COPY config ./config

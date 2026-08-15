@@ -584,6 +584,8 @@ impl AppConfig {
 
         if let Ok(public_bind_addr) = env::var("FIREWALL_PUBLIC_BIND_ADDR") {
             config.server.public_bind_addr = public_bind_addr;
+        } else if let Ok(port) = env::var("PORT") {
+            config.server.public_bind_addr = public_bind_addr_from_port_env(&port);
         }
 
         if let Ok(admin_bind_addr) = env::var("FIREWALL_ADMIN_BIND_ADDR") {
@@ -757,9 +759,23 @@ fn parse_bool_env(value: &str) -> bool {
     )
 }
 
+fn public_bind_addr_from_port_env(port: &str) -> String {
+    format!("0.0.0.0:{}", port.trim())
+}
+
 fn is_known_placeholder_secret(value: &str) -> bool {
     matches!(
         value.trim(),
         "" | "dev-admin-token-1" | "replace-me-admin-token" | "replace-me-in-production"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::public_bind_addr_from_port_env;
+
+    #[test]
+    fn derives_public_bind_addr_from_platform_port() {
+        assert_eq!(public_bind_addr_from_port_env(" 12345 "), "0.0.0.0:12345");
+    }
 }
