@@ -2,15 +2,18 @@ use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{
-    params, params_from_iter,
-    types::Value as SqlValue,
-    Connection,
-};
+use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection};
 
 use crate::{
     mitigation::ActiveMitigation,
-    types::{AdminAudit, AnalystSuppression, ApprovedShadowRoute, AuditSearchFilters, EventSearchFilters, LearnedRoute, ManagedSpecReleaseState, ManagedSpecRoute, PersistedBehaviorSnapshot, PolicyBundle, PolicyTimelineEntry, PrincipalAllowlistEntry, PromotedSpecRoute, ResponseContract, RestoreRefusalAlert, RestoreRefusalEvent, ScopedPrincipalAllowlistEntry, ScopedSourceAllowlistEntry, SecurityEvent, Severity, SourceAllowlistEntry, SourceReputation, TriScopedAllowlistEntry},
+    types::{
+        AdminAudit, AnalystSuppression, ApprovedShadowRoute, AuditSearchFilters,
+        EventSearchFilters, LearnedRoute, ManagedSpecReleaseState, ManagedSpecRoute,
+        PersistedBehaviorSnapshot, PolicyBundle, PolicyTimelineEntry, PrincipalAllowlistEntry,
+        PromotedSpecRoute, ResponseContract, RestoreRefusalAlert, RestoreRefusalEvent,
+        ScopedPrincipalAllowlistEntry, ScopedSourceAllowlistEntry, SecurityEvent, Severity,
+        SourceAllowlistEntry, SourceReputation, TriScopedAllowlistEntry,
+    },
 };
 
 pub fn init_db(sqlite_path: &str) -> Result<()> {
@@ -468,11 +471,15 @@ pub fn query_security_events(
     }
 
     sql.push_str(" ORDER BY timestamp DESC LIMIT ? OFFSET ?");
-    values.push(SqlValue::Integer(filters.limit.unwrap_or(20).clamp(1, 500) as i64));
+    values.push(SqlValue::Integer(
+        filters.limit.unwrap_or(20).clamp(1, 500) as i64
+    ));
     values.push(SqlValue::Integer(filters.offset.unwrap_or(0) as i64));
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(values.iter()), |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map(params_from_iter(values.iter()), |row| {
+        row.get::<_, String>(0)
+    })?;
 
     let mut items = Vec::new();
     for row in rows {
@@ -524,11 +531,15 @@ pub fn query_admin_audits(
     }
 
     sql.push_str(" ORDER BY timestamp DESC LIMIT ? OFFSET ?");
-    values.push(SqlValue::Integer(filters.limit.unwrap_or(20).clamp(1, 500) as i64));
+    values.push(SqlValue::Integer(
+        filters.limit.unwrap_or(20).clamp(1, 500) as i64
+    ));
     values.push(SqlValue::Integer(filters.offset.unwrap_or(0) as i64));
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(values.iter()), |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map(params_from_iter(values.iter()), |row| {
+        row.get::<_, String>(0)
+    })?;
 
     let mut items = Vec::new();
     for row in rows {
@@ -617,22 +628,30 @@ pub fn load_active_mitigations(sqlite_path: &str) -> Result<Vec<ActiveMitigation
         let reason: String = row.get(6)?;
 
         let action = match action_type.as_str() {
-            "block_source_ip_temporary" => {
-                crate::types::MitigationAction::BlockSourceIpTemporary { ttl_secs: ttl_secs as u64 }
-            }
-            "throttle_source" => crate::types::MitigationAction::ThrottleSource { ttl_secs: ttl_secs as u64 },
-            "mark_source_suspicious" => {
-                crate::types::MitigationAction::MarkSourceSuspicious { ttl_secs: ttl_secs as u64 }
-            }
-            _ => crate::types::MitigationAction::BlockSourceIpTemporary { ttl_secs: ttl_secs as u64 },
+            "block_source_ip_temporary" => crate::types::MitigationAction::BlockSourceIpTemporary {
+                ttl_secs: ttl_secs as u64,
+            },
+            "throttle_source" => crate::types::MitigationAction::ThrottleSource {
+                ttl_secs: ttl_secs as u64,
+            },
+            "mark_source_suspicious" => crate::types::MitigationAction::MarkSourceSuspicious {
+                ttl_secs: ttl_secs as u64,
+            },
+            _ => crate::types::MitigationAction::BlockSourceIpTemporary {
+                ttl_secs: ttl_secs as u64,
+            },
         };
 
         Ok(ActiveMitigation {
             action_id,
-            source_ip: source_ip.parse().map_err(|_| rusqlite::Error::InvalidQuery)?,
+            source_ip: source_ip
+                .parse()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
             action,
-            created_at: parse_rfc3339_to_utc(&created_at).map_err(|_| rusqlite::Error::InvalidQuery)?,
-            expires_at: parse_rfc3339_to_utc(&expires_at).map_err(|_| rusqlite::Error::InvalidQuery)?,
+            created_at: parse_rfc3339_to_utc(&created_at)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            expires_at: parse_rfc3339_to_utc(&expires_at)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
             reason,
         })
     })?;
@@ -688,7 +707,8 @@ pub fn load_reputations(sqlite_path: &str) -> Result<Vec<SourceReputation>> {
         Ok(SourceReputation {
             source_ip,
             suspicious_score,
-            last_seen_at: parse_rfc3339_to_utc(&last_seen_at).map_err(|_| rusqlite::Error::InvalidQuery)?,
+            last_seen_at: parse_rfc3339_to_utc(&last_seen_at)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
         })
     })?;
 
@@ -702,7 +722,10 @@ pub fn load_reputations(sqlite_path: &str) -> Result<Vec<SourceReputation>> {
 
 pub fn delete_reputation(sqlite_path: &str, source_ip: &str) -> Result<()> {
     let conn = Connection::open(sqlite_path)?;
-    conn.execute("DELETE FROM reputations WHERE source_ip = ?1", params![source_ip])?;
+    conn.execute(
+        "DELETE FROM reputations WHERE source_ip = ?1",
+        params![source_ip],
+    )?;
     Ok(())
 }
 
@@ -710,7 +733,11 @@ pub fn upsert_learned_route(sqlite_path: &str, route: &LearnedRoute) -> Result<(
     ensure_parent_dir(sqlite_path)?;
 
     let conn = Connection::open(sqlite_path)?;
-    let route_key = format!("{}:{}", route.method.to_ascii_uppercase(), route.normalized_path);
+    let route_key = format!(
+        "{}:{}",
+        route.method.to_ascii_uppercase(),
+        route.normalized_path
+    );
     let json = serde_json::to_string(route)?;
 
     conn.execute(
@@ -761,7 +788,11 @@ pub fn replace_learned_routes(sqlite_path: &str, routes: &[LearnedRoute]) -> Res
     tx.execute("DELETE FROM learned_routes", [])?;
 
     for route in routes {
-        let route_key = format!("{}:{}", route.method.to_ascii_uppercase(), route.normalized_path);
+        let route_key = format!(
+            "{}:{}",
+            route.method.to_ascii_uppercase(),
+            route.normalized_path
+        );
         let json = serde_json::to_string(route)?;
 
         tx.execute(
@@ -873,13 +904,14 @@ pub fn query_behavior_snapshots(sqlite_path: &str) -> Result<Vec<PersistedBehavi
     Ok(items)
 }
 
-pub fn upsert_approved_shadow_route(
-    sqlite_path: &str,
-    route: &ApprovedShadowRoute,
-) -> Result<()> {
+pub fn upsert_approved_shadow_route(sqlite_path: &str, route: &ApprovedShadowRoute) -> Result<()> {
     ensure_parent_dir(sqlite_path)?;
     let conn = Connection::open(sqlite_path)?;
-    let route_key = format!("{}:{}", route.method.to_ascii_uppercase(), route.normalized_path);
+    let route_key = format!(
+        "{}:{}",
+        route.method.to_ascii_uppercase(),
+        route.normalized_path
+    );
     let json = serde_json::to_string(route)?;
 
     conn.execute(
@@ -952,13 +984,14 @@ pub fn delete_approved_shadow_route(
     Ok(affected > 0)
 }
 
-pub fn upsert_promoted_spec_route(
-    sqlite_path: &str,
-    route: &PromotedSpecRoute,
-) -> Result<()> {
+pub fn upsert_promoted_spec_route(sqlite_path: &str, route: &PromotedSpecRoute) -> Result<()> {
     ensure_parent_dir(sqlite_path)?;
     let conn = Connection::open(sqlite_path)?;
-    let route_key = format!("{}:{}", route.method.to_ascii_uppercase(), route.normalized_path);
+    let route_key = format!(
+        "{}:{}",
+        route.method.to_ascii_uppercase(),
+        route.normalized_path
+    );
     let json = serde_json::to_string(route)?;
 
     conn.execute(
@@ -1033,13 +1066,14 @@ pub fn delete_promoted_spec_route(
     Ok(affected > 0)
 }
 
-pub fn upsert_managed_spec_route(
-    sqlite_path: &str,
-    route: &ManagedSpecRoute,
-) -> Result<()> {
+pub fn upsert_managed_spec_route(sqlite_path: &str, route: &ManagedSpecRoute) -> Result<()> {
     ensure_parent_dir(sqlite_path)?;
     let conn = Connection::open(sqlite_path)?;
-    let route_key = format!("{}:{}", route.method.to_ascii_uppercase(), route.normalized_path);
+    let route_key = format!(
+        "{}:{}",
+        route.method.to_ascii_uppercase(),
+        route.normalized_path
+    );
     let json = serde_json::to_string(route)?;
 
     conn.execute(
@@ -1114,10 +1148,7 @@ pub fn delete_managed_spec_route(
     Ok(affected > 0)
 }
 
-pub fn upsert_analyst_suppression(
-    sqlite_path: &str,
-    item: &AnalystSuppression,
-) -> Result<()> {
+pub fn upsert_analyst_suppression(sqlite_path: &str, item: &AnalystSuppression) -> Result<()> {
     ensure_parent_dir(sqlite_path)?;
     let conn = Connection::open(sqlite_path)?;
     let suppression_key = match &item.path_prefix {
@@ -1200,10 +1231,7 @@ pub fn delete_analyst_suppression(
     Ok(affected > 0)
 }
 
-pub fn upsert_source_allowlist(
-    sqlite_path: &str,
-    entry: &SourceAllowlistEntry,
-) -> Result<()> {
+pub fn upsert_source_allowlist(sqlite_path: &str, entry: &SourceAllowlistEntry) -> Result<()> {
     ensure_parent_dir(sqlite_path)?;
     let conn = Connection::open(sqlite_path)?;
     let json = serde_json::to_string(entry)?;
@@ -1342,13 +1370,14 @@ pub fn delete_principal_allowlist(sqlite_path: &str, principal_prefix: &str) -> 
     Ok(affected > 0)
 }
 
-pub fn upsert_response_contract(
-    sqlite_path: &str,
-    contract: &ResponseContract,
-) -> Result<()> {
+pub fn upsert_response_contract(sqlite_path: &str, contract: &ResponseContract) -> Result<()> {
     ensure_parent_dir(sqlite_path)?;
     let conn = Connection::open(sqlite_path)?;
-    let route_key = format!("{}:{}", contract.method.to_ascii_uppercase(), contract.normalized_path);
+    let route_key = format!(
+        "{}:{}",
+        contract.method.to_ascii_uppercase(),
+        contract.normalized_path
+    );
     let json = serde_json::to_string(contract)?;
 
     conn.execute(
@@ -1483,9 +1512,8 @@ pub fn get_policy_bundle(sqlite_path: &str, bundle_id: &str) -> Result<Option<Po
     }
 
     let conn = Connection::open(sqlite_path)?;
-    let mut stmt = conn.prepare(
-        "SELECT bundle_json FROM policy_bundles WHERE bundle_id = ?1 LIMIT 1"
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT bundle_json FROM policy_bundles WHERE bundle_id = ?1 LIMIT 1")?;
 
     let mut rows = stmt.query(params![bundle_id])?;
     if let Some(row) = rows.next()? {
@@ -1520,7 +1548,15 @@ pub fn upsert_scoped_source_allowlist(
             reason = excluded.reason,
             entry_json = excluded.entry_json
         "#,
-        params![key, entry.source_ip, entry.path_prefix, entry.created_at.to_rfc3339(), entry.created_by, entry.reason, json],
+        params![
+            key,
+            entry.source_ip,
+            entry.path_prefix,
+            entry.created_at.to_rfc3339(),
+            entry.created_by,
+            entry.reason,
+            json
+        ],
     )?;
 
     Ok(())
@@ -1532,7 +1568,8 @@ pub fn query_scoped_source_allowlist(sqlite_path: &str) -> Result<Vec<ScopedSour
     }
 
     let conn = Connection::open(sqlite_path)?;
-    let mut stmt = conn.prepare("SELECT entry_json FROM scoped_source_allowlist ORDER BY created_at DESC")?;
+    let mut stmt =
+        conn.prepare("SELECT entry_json FROM scoped_source_allowlist ORDER BY created_at DESC")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
 
     let mut items = Vec::new();
@@ -1544,14 +1581,21 @@ pub fn query_scoped_source_allowlist(sqlite_path: &str) -> Result<Vec<ScopedSour
     Ok(items)
 }
 
-pub fn delete_scoped_source_allowlist(sqlite_path: &str, source_ip: &str, path_prefix: &str) -> Result<bool> {
+pub fn delete_scoped_source_allowlist(
+    sqlite_path: &str,
+    source_ip: &str,
+    path_prefix: &str,
+) -> Result<bool> {
     if !Path::new(sqlite_path).exists() {
         return Ok(false);
     }
 
     let conn = Connection::open(sqlite_path)?;
     let key = format!("{}|{}", source_ip, path_prefix);
-    let affected = conn.execute("DELETE FROM scoped_source_allowlist WHERE allowlist_key = ?1", params![key])?;
+    let affected = conn.execute(
+        "DELETE FROM scoped_source_allowlist WHERE allowlist_key = ?1",
+        params![key],
+    )?;
 
     Ok(affected > 0)
 }
@@ -1576,19 +1620,30 @@ pub fn upsert_scoped_principal_allowlist(
             reason = excluded.reason,
             entry_json = excluded.entry_json
         "#,
-        params![key, entry.principal_prefix, entry.path_prefix, entry.created_at.to_rfc3339(), entry.created_by, entry.reason, json],
+        params![
+            key,
+            entry.principal_prefix,
+            entry.path_prefix,
+            entry.created_at.to_rfc3339(),
+            entry.created_by,
+            entry.reason,
+            json
+        ],
     )?;
 
     Ok(())
 }
 
-pub fn query_scoped_principal_allowlist(sqlite_path: &str) -> Result<Vec<ScopedPrincipalAllowlistEntry>> {
+pub fn query_scoped_principal_allowlist(
+    sqlite_path: &str,
+) -> Result<Vec<ScopedPrincipalAllowlistEntry>> {
     if !Path::new(sqlite_path).exists() {
         return Ok(Vec::new());
     }
 
     let conn = Connection::open(sqlite_path)?;
-    let mut stmt = conn.prepare("SELECT entry_json FROM scoped_principal_allowlist ORDER BY created_at DESC")?;
+    let mut stmt =
+        conn.prepare("SELECT entry_json FROM scoped_principal_allowlist ORDER BY created_at DESC")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
 
     let mut items = Vec::new();
@@ -1600,22 +1655,35 @@ pub fn query_scoped_principal_allowlist(sqlite_path: &str) -> Result<Vec<ScopedP
     Ok(items)
 }
 
-pub fn delete_scoped_principal_allowlist(sqlite_path: &str, principal_prefix: &str, path_prefix: &str) -> Result<bool> {
+pub fn delete_scoped_principal_allowlist(
+    sqlite_path: &str,
+    principal_prefix: &str,
+    path_prefix: &str,
+) -> Result<bool> {
     if !Path::new(sqlite_path).exists() {
         return Ok(false);
     }
 
     let conn = Connection::open(sqlite_path)?;
     let key = format!("{}|{}", principal_prefix, path_prefix);
-    let affected = conn.execute("DELETE FROM scoped_principal_allowlist WHERE allowlist_key = ?1", params![key])?;
+    let affected = conn.execute(
+        "DELETE FROM scoped_principal_allowlist WHERE allowlist_key = ?1",
+        params![key],
+    )?;
 
     Ok(affected > 0)
 }
 
-pub fn upsert_tri_scoped_allowlist(sqlite_path: &str, entry: &TriScopedAllowlistEntry) -> Result<()> {
+pub fn upsert_tri_scoped_allowlist(
+    sqlite_path: &str,
+    entry: &TriScopedAllowlistEntry,
+) -> Result<()> {
     ensure_parent_dir(sqlite_path)?;
     let conn = Connection::open(sqlite_path)?;
-    let key = format!("{}|{}|{}", entry.source_ip, entry.principal_prefix, entry.path_prefix);
+    let key = format!(
+        "{}|{}|{}",
+        entry.source_ip, entry.principal_prefix, entry.path_prefix
+    );
     let json = serde_json::to_string(entry)?;
 
     conn.execute(
@@ -1642,7 +1710,8 @@ pub fn query_tri_scoped_allowlist(sqlite_path: &str) -> Result<Vec<TriScopedAllo
     }
 
     let conn = Connection::open(sqlite_path)?;
-    let mut stmt = conn.prepare("SELECT entry_json FROM tri_scoped_allowlist ORDER BY created_at DESC")?;
+    let mut stmt =
+        conn.prepare("SELECT entry_json FROM tri_scoped_allowlist ORDER BY created_at DESC")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
 
     let mut items = Vec::new();
@@ -1654,14 +1723,22 @@ pub fn query_tri_scoped_allowlist(sqlite_path: &str) -> Result<Vec<TriScopedAllo
     Ok(items)
 }
 
-pub fn delete_tri_scoped_allowlist(sqlite_path: &str, source_ip: &str, principal_prefix: &str, path_prefix: &str) -> Result<bool> {
+pub fn delete_tri_scoped_allowlist(
+    sqlite_path: &str,
+    source_ip: &str,
+    principal_prefix: &str,
+    path_prefix: &str,
+) -> Result<bool> {
     if !Path::new(sqlite_path).exists() {
         return Ok(false);
     }
 
     let conn = Connection::open(sqlite_path)?;
     let key = format!("{}|{}|{}", source_ip, principal_prefix, path_prefix);
-    let affected = conn.execute("DELETE FROM tri_scoped_allowlist WHERE allowlist_key = ?1", params![key])?;
+    let affected = conn.execute(
+        "DELETE FROM tri_scoped_allowlist WHERE allowlist_key = ?1",
+        params![key],
+    )?;
 
     Ok(affected > 0)
 }
@@ -1708,9 +1785,8 @@ pub fn query_restore_refusal_alerts(sqlite_path: &str) -> Result<Vec<RestoreRefu
     }
 
     let conn = Connection::open(sqlite_path)?;
-    let mut stmt = conn.prepare(
-        "SELECT alert_json FROM restore_refusal_alerts ORDER BY created_at DESC",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT alert_json FROM restore_refusal_alerts ORDER BY created_at DESC")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
 
     let mut items = Vec::new();
@@ -1722,15 +1798,17 @@ pub fn query_restore_refusal_alerts(sqlite_path: &str) -> Result<Vec<RestoreRefu
     Ok(items)
 }
 
-pub fn get_restore_refusal_alert(sqlite_path: &str, alert_id: &str) -> Result<Option<RestoreRefusalAlert>> {
+pub fn get_restore_refusal_alert(
+    sqlite_path: &str,
+    alert_id: &str,
+) -> Result<Option<RestoreRefusalAlert>> {
     if !Path::new(sqlite_path).exists() {
         return Ok(None);
     }
 
     let conn = Connection::open(sqlite_path)?;
-    let mut stmt = conn.prepare(
-        "SELECT alert_json FROM restore_refusal_alerts WHERE alert_id = ?1 LIMIT 1",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT alert_json FROM restore_refusal_alerts WHERE alert_id = ?1 LIMIT 1")?;
 
     let mut rows = stmt.query(params![alert_id])?;
     if let Some(row) = rows.next()? {
@@ -1768,7 +1846,10 @@ pub fn query_policy_timeline_page(
             total: 0,
             limit: filters.limit.unwrap_or(50),
             offset: filters.offset.unwrap_or(0),
-            sort_dir: filters.sort_dir.clone().unwrap_or_else(|| "desc".to_string()),
+            sort_dir: filters
+                .sort_dir
+                .clone()
+                .unwrap_or_else(|| "desc".to_string()),
         });
     }
 
@@ -1786,7 +1867,10 @@ pub fn query_policy_timeline_page(
     }
     if let Some(target_contains) = &filters.target_contains {
         where_sql.push_str(" AND target LIKE ?");
-        values.push(rusqlite::types::Value::Text(format!("%{}%", target_contains)));
+        values.push(rusqlite::types::Value::Text(format!(
+            "%{}%",
+            target_contains
+        )));
     }
     if let Some(result) = &filters.result {
         where_sql.push_str(" AND result = ?");
@@ -1794,11 +1878,9 @@ pub fn query_policy_timeline_page(
     }
 
     let count_sql = format!("SELECT COUNT(*) FROM admin_audits{}", where_sql);
-    let total: usize = conn.query_row(
-        &count_sql,
-        params_from_iter(values.iter()),
-        |row| row.get::<_, i64>(0).map(|v| v as usize),
-    )?;
+    let total: usize = conn.query_row(&count_sql, params_from_iter(values.iter()), |row| {
+        row.get::<_, i64>(0).map(|v| v as usize)
+    })?;
 
     let sort_dir = match filters.sort_dir.as_deref() {
         Some("asc") => "ASC",
@@ -1810,11 +1892,17 @@ pub fn query_policy_timeline_page(
         "SELECT audit_json FROM admin_audits{} ORDER BY timestamp {} LIMIT ? OFFSET ?",
         where_sql, sort_dir,
     );
-    page_values.push(rusqlite::types::Value::Integer(filters.limit.unwrap_or(50) as i64));
-    page_values.push(rusqlite::types::Value::Integer(filters.offset.unwrap_or(0) as i64));
+    page_values.push(rusqlite::types::Value::Integer(
+        filters.limit.unwrap_or(50) as i64
+    ));
+    page_values.push(rusqlite::types::Value::Integer(
+        filters.offset.unwrap_or(0) as i64
+    ));
 
     let mut stmt = conn.prepare(&page_sql)?;
-    let rows = stmt.query_map(params_from_iter(page_values.iter()), |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map(params_from_iter(page_values.iter()), |row| {
+        row.get::<_, String>(0)
+    })?;
 
     let mut items = Vec::new();
     for row in rows {
@@ -1944,7 +2032,10 @@ pub fn query_policy_timeline_filtered(
     }
     if let Some(target_contains) = &filters.target_contains {
         sql.push_str(" AND target LIKE ?");
-        params_vec.push(rusqlite::types::Value::Text(format!("%{}%", target_contains)));
+        params_vec.push(rusqlite::types::Value::Text(format!(
+            "%{}%",
+            target_contains
+        )));
     }
     if let Some(result) = &filters.result {
         sql.push_str(" AND result = ?");
@@ -1952,11 +2043,17 @@ pub fn query_policy_timeline_filtered(
     }
 
     sql.push_str(" ORDER BY timestamp DESC LIMIT ? OFFSET ?");
-    params_vec.push(rusqlite::types::Value::Integer(filters.limit.unwrap_or(50) as i64));
-    params_vec.push(rusqlite::types::Value::Integer(filters.offset.unwrap_or(0) as i64));
+    params_vec.push(rusqlite::types::Value::Integer(
+        filters.limit.unwrap_or(50) as i64
+    ));
+    params_vec.push(rusqlite::types::Value::Integer(
+        filters.offset.unwrap_or(0) as i64
+    ));
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params_vec.iter()), |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map(params_from_iter(params_vec.iter()), |row| {
+        row.get::<_, String>(0)
+    })?;
 
     let mut items = Vec::new();
     for row in rows {
@@ -1980,7 +2077,11 @@ pub fn upsert_managed_spec_release_state(
 ) -> Result<()> {
     ensure_parent_dir(sqlite_path)?;
     let conn = Connection::open(sqlite_path)?;
-    let route_key = format!("{}:{}", item.method.to_ascii_uppercase(), item.normalized_path);
+    let route_key = format!(
+        "{}:{}",
+        item.method.to_ascii_uppercase(),
+        item.normalized_path
+    );
     let json = serde_json::to_string(item)?;
 
     conn.execute(
@@ -2016,9 +2117,8 @@ pub fn query_managed_spec_release_state(sqlite_path: &str) -> Result<Vec<Managed
     }
 
     let conn = Connection::open(sqlite_path)?;
-    let mut stmt = conn.prepare(
-        "SELECT state_json FROM managed_spec_release_state ORDER BY updated_at DESC",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT state_json FROM managed_spec_release_state ORDER BY updated_at DESC")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
 
     let mut items = Vec::new();
@@ -2060,9 +2160,8 @@ pub fn tamper_policy_bundle_note(
 
     let conn = Connection::open(sqlite_path)?;
 
-    let mut stmt = conn.prepare(
-        "SELECT bundle_json FROM policy_bundles WHERE bundle_id = ?1 LIMIT 1",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT bundle_json FROM policy_bundles WHERE bundle_id = ?1 LIMIT 1")?;
 
     let json_str: String = match stmt.query_row(params![bundle_id], |row| row.get(0)) {
         Ok(v) => v,
@@ -2155,11 +2254,8 @@ pub fn metrics_snapshot(sqlite_path: &str) -> Result<StorageMetrics> {
 
     let conn = Connection::open(sqlite_path)?;
 
-    let total_events: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM security_events",
-        [],
-        |row| row.get(0),
-    )?;
+    let total_events: i64 =
+        conn.query_row("SELECT COUNT(*) FROM security_events", [], |row| row.get(0))?;
 
     let blocked_events: i64 = conn.query_row(
         "SELECT COUNT(*) FROM security_events WHERE outcome LIKE 'reject:%'",
@@ -2167,89 +2263,67 @@ pub fn metrics_snapshot(sqlite_path: &str) -> Result<StorageMetrics> {
         |row| row.get(0),
     )?;
 
-    let total_audits: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM admin_audits",
-        [],
-        |row| row.get(0),
-    )?;
+    let total_audits: i64 =
+        conn.query_row("SELECT COUNT(*) FROM admin_audits", [], |row| row.get(0))?;
 
-    let persisted_active_mitigations: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM active_mitigations",
-        [],
-        |row| row.get(0),
-    )?;
+    let persisted_active_mitigations: i64 =
+        conn.query_row("SELECT COUNT(*) FROM active_mitigations", [], |row| {
+            row.get(0)
+        })?;
 
-    let persisted_reputations: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM reputations",
-        [],
-        |row| row.get(0),
-    )?;
+    let persisted_reputations: i64 =
+        conn.query_row("SELECT COUNT(*) FROM reputations", [], |row| row.get(0))?;
 
-    let persisted_learned_routes: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM learned_routes",
-        [],
-        |row| row.get(0),
-    )?;
+    let persisted_learned_routes: i64 =
+        conn.query_row("SELECT COUNT(*) FROM learned_routes", [], |row| row.get(0))?;
 
-    let persisted_behavior_snapshots: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM behavior_snapshots",
-        [],
-        |row| row.get(0),
-    )?;
+    let persisted_behavior_snapshots: i64 =
+        conn.query_row("SELECT COUNT(*) FROM behavior_snapshots", [], |row| {
+            row.get(0)
+        })?;
 
-    let approved_shadow_routes: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM approved_shadow_routes",
-        [],
-        |row| row.get(0),
-    )?;
+    let approved_shadow_routes: i64 =
+        conn.query_row("SELECT COUNT(*) FROM approved_shadow_routes", [], |row| {
+            row.get(0)
+        })?;
 
-    let promoted_spec_routes: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM promoted_spec_routes",
-        [],
-        |row| row.get(0),
-    )?;
+    let promoted_spec_routes: i64 =
+        conn.query_row("SELECT COUNT(*) FROM promoted_spec_routes", [], |row| {
+            row.get(0)
+        })?;
 
-    let managed_spec_routes: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM managed_spec_routes",
-        [],
-        |row| row.get(0),
-    )?;
+    let managed_spec_routes: i64 =
+        conn.query_row("SELECT COUNT(*) FROM managed_spec_routes", [], |row| {
+            row.get(0)
+        })?;
 
-    let analyst_suppressions: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM analyst_suppressions",
-        [],
-        |row| row.get(0),
-    )?;
+    let analyst_suppressions: i64 =
+        conn.query_row("SELECT COUNT(*) FROM analyst_suppressions", [], |row| {
+            row.get(0)
+        })?;
 
-    let source_allowlist_entries: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM source_allowlist",
-        [],
-        |row| row.get(0),
-    )?;
+    let source_allowlist_entries: i64 =
+        conn.query_row("SELECT COUNT(*) FROM source_allowlist", [], |row| {
+            row.get(0)
+        })?;
 
-    let principal_allowlist_entries: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM principal_allowlist",
-        [],
-        |row| row.get(0),
-    )?;
+    let principal_allowlist_entries: i64 =
+        conn.query_row("SELECT COUNT(*) FROM principal_allowlist", [], |row| {
+            row.get(0)
+        })?;
 
-    let response_contracts: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM response_contracts",
-        [],
-        |row| row.get(0),
-    )?;
+    let response_contracts: i64 =
+        conn.query_row("SELECT COUNT(*) FROM response_contracts", [], |row| {
+            row.get(0)
+        })?;
 
-    let policy_bundles: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM policy_bundles",
-        [],
-        |row| row.get(0),
-    )?;
+    let policy_bundles: i64 =
+        conn.query_row("SELECT COUNT(*) FROM policy_bundles", [], |row| row.get(0))?;
 
-    let scoped_source_allowlist_entries: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM scoped_source_allowlist",
-        [],
-        |row| row.get(0),
-    )?;
+    let scoped_source_allowlist_entries: i64 =
+        conn.query_row("SELECT COUNT(*) FROM scoped_source_allowlist", [], |row| {
+            row.get(0)
+        })?;
 
     let scoped_principal_allowlist_entries: i64 = conn.query_row(
         "SELECT COUNT(*) FROM scoped_principal_allowlist",
@@ -2257,17 +2331,15 @@ pub fn metrics_snapshot(sqlite_path: &str) -> Result<StorageMetrics> {
         |row| row.get(0),
     )?;
 
-    let tri_scoped_allowlist_entries: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM tri_scoped_allowlist",
-        [],
-        |row| row.get(0),
-    )?;
+    let tri_scoped_allowlist_entries: i64 =
+        conn.query_row("SELECT COUNT(*) FROM tri_scoped_allowlist", [], |row| {
+            row.get(0)
+        })?;
 
-    let restore_refusals: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM restore_refusals",
-        [],
-        |row| row.get(0),
-    )?;
+    let restore_refusals: i64 =
+        conn.query_row("SELECT COUNT(*) FROM restore_refusals", [], |row| {
+            row.get(0)
+        })?;
 
     let managed_spec_release_states: i64 = conn.query_row(
         "SELECT COUNT(*) FROM managed_spec_release_state",
@@ -2275,11 +2347,10 @@ pub fn metrics_snapshot(sqlite_path: &str) -> Result<StorageMetrics> {
         |row| row.get(0),
     )?;
 
-    let restore_refusal_alerts: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM restore_refusal_alerts",
-        [],
-        |row| row.get(0),
-    )?;
+    let restore_refusal_alerts: i64 =
+        conn.query_row("SELECT COUNT(*) FROM restore_refusal_alerts", [], |row| {
+            row.get(0)
+        })?;
 
     let critical_restore_refusal_alerts: i64 = conn.query_row(
         "SELECT COUNT(*) FROM restore_refusal_alerts WHERE severity = 'critical' AND status != 'resolved'",

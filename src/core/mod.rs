@@ -67,7 +67,11 @@ pub async fn request_context_middleware(
     let (mut parts, body) = request.into_parts();
     let headers = parts.headers.clone();
 
-    let source_ip = resolve_source_ip(&state, &headers, parts.extensions.get::<ConnectInfo<SocketAddr>>());
+    let source_ip = resolve_source_ip(
+        &state,
+        &headers,
+        parts.extensions.get::<ConnectInfo<SocketAddr>>(),
+    );
     let path = parts.uri.path().to_string();
     let query = parts.uri.query().map(ToOwned::to_owned);
     let method = parts.method.to_string();
@@ -80,9 +84,17 @@ pub async fn request_context_middleware(
         }
     };
 
-    let preview_limit = state.config.security.max_inspection_body_bytes.min(body_bytes.len());
+    let preview_limit = state
+        .config
+        .security
+        .max_inspection_body_bytes
+        .min(body_bytes.len());
     let preview = String::from_utf8_lossy(&body_bytes[..preview_limit]).to_string();
-    let body_preview = if preview.is_empty() { None } else { Some(preview.clone()) };
+    let body_preview = if preview.is_empty() {
+        None
+    } else {
+        Some(preview.clone())
+    };
 
     let parsed_body_fields = extract_parsed_fields(&preview);
     let auth_status = resolve_auth_status(&state, &path, &headers);
@@ -133,7 +145,8 @@ pub async fn security_middleware(
                 "blocked source attempted request"
             );
 
-            let mut response = (StatusCode::FORBIDDEN, "source temporarily blocked").into_response();
+            let mut response =
+                (StatusCode::FORBIDDEN, "source temporarily blocked").into_response();
             if let Ok(value) = HeaderValue::from_str(&ctx.request_id) {
                 response.headers_mut().insert("x-request-id", value);
             }
@@ -237,7 +250,29 @@ pub fn enrich_request(
     };
 
     let has_auth = matches!(request.auth_status, AuthStatus::Satisfied);
-    remember_route(&request.method, &normalized_path, has_auth);
+    let request_content_type = header_value(headers, "content-type")
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or(&value)
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|value| !value.is_empty());
+    let request_size_bytes = request
+        .body_preview
+        .as_ref()
+        .map(|body| body.len())
+        .unwrap_or(0);
+    let learned_route_hits = remember_route(
+        state,
+        &request.method,
+        &normalized_path,
+        has_auth,
+        request_content_type.as_deref(),
+        request_size_bytes,
+    );
 
     EnrichedRequestContext {
         request: request.clone(),
@@ -252,6 +287,9 @@ pub fn enrich_request(
         required_scopes,
         schema_mode: state.config.spec.unknown_route_mode.clone(),
         object_id_candidates: extract_object_id_candidates(request),
+        learned_route_hits,
+        request_content_type,
+        request_size_bytes,
     }
 }
 
@@ -360,7 +398,10 @@ pub fn validate_against_spec(
                 enriched,
                 "schema.max_fields",
                 Severity::Medium,
-                format!("JSON body exceeds max field count {}", route.body.max_fields),
+                format!(
+                    "JSON body exceeds max field count {}",
+                    route.body.max_fields
+                ),
                 "request.body".to_string(),
                 truncate(body, 160),
             );
@@ -419,7 +460,9 @@ pub fn calculate_risk(findings: &[Finding], reputation_score: i32) -> f32 {
             AttackClass::ObjectEnumeration | AttackClass::TenantBoundaryViolation => {
                 object_abuse += severity_weight(&finding.severity)
             }
-            AttackClass::BehaviorAnomaly | AttackClass::BruteForce | AttackClass::RateLimitExceeded => {
+            AttackClass::BehaviorAnomaly
+            | AttackClass::BruteForce
+            | AttackClass::RateLimitExceeded => {
                 behavior_anomaly += severity_weight(&finding.severity)
             }
             _ => {}
@@ -455,7 +498,11 @@ pub fn restore_learned_routes(routes: &[crate::types::LearnedRoute]) {
     let mut guard = ROUTE_MEMORY.write().expect("route memory poisoned");
 
     for route in routes {
-        let key = format!("{}:{}", route.method.to_ascii_uppercase(), route.normalized_path);
+        let key = format!(
+            "{}:{}",
+            route.method.to_ascii_uppercase(),
+            route.normalized_path
+        );
         match guard.get_mut(&key) {
             Some(existing) => {
                 existing.first_seen = existing.first_seen.min(route.first_seen);
@@ -470,7 +517,9 @@ pub fn restore_learned_routes(routes: &[crate::types::LearnedRoute]) {
     }
 }
 
-pub fn approved_shadow_route_keys(sqlite_path: &str) -> anyhow::Result<std::collections::HashSet<String>> {
+pub fn approved_shadow_route_keys(
+    sqlite_path: &str,
+) -> anyhow::Result<std::collections::HashSet<String>> {
     let items = storage::query_approved_shadow_routes(sqlite_path)?;
     Ok(items
         .into_iter()
@@ -503,19 +552,21 @@ pub fn managed_spec_route_keys(
 }
 
 pub fn discover_shadow_apis_filtered(state: &AppState) -> Vec<crate::types::LearnedRoute> {
-    let approved = approved_shadow_route_keys(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
+    let approved =
+        approved_shadow_route_keys(&state.config.storage.sqlite_path).unwrap_or_default();
 
-    let promoted = promoted_spec_route_keys(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
+    let promoted = promoted_spec_route_keys(&state.config.storage.sqlite_path).unwrap_or_default();
 
-    let managed = managed_spec_route_keys(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
+    let managed = managed_spec_route_keys(&state.config.storage.sqlite_path).unwrap_or_default();
 
     discover_shadow_apis(state)
         .into_iter()
         .filter(|route| {
-            let key = format!("{}:{}", route.method.to_ascii_uppercase(), route.normalized_path);
+            let key = format!(
+                "{}:{}",
+                route.method.to_ascii_uppercase(),
+                route.normalized_path
+            );
             !approved.contains(&key) && !promoted.contains(&key) && !managed.contains(&key)
         })
         .collect()
@@ -540,10 +591,10 @@ pub fn is_tri_scoped_allowlisted(
 pub fn export_gateway_managed_spec_inventory(
     state: &AppState,
 ) -> crate::types::GatewayManagedSpecExport {
-    let managed_routes = storage::query_managed_spec_routes(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
-    let contracts = storage::query_response_contracts(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
+    let managed_routes =
+        storage::query_managed_spec_routes(&state.config.storage.sqlite_path).unwrap_or_default();
+    let contracts =
+        storage::query_response_contracts(&state.config.storage.sqlite_path).unwrap_or_default();
 
     let routes = managed_routes
         .into_iter()
@@ -579,7 +630,10 @@ pub fn build_response_contract_from_mismatch_event(
     actor: String,
     note: Option<String>,
 ) -> Option<crate::types::ResponseContract> {
-    let mismatch = event.findings.iter().find(|f| f.rule_id == "response.contract_mismatch")?;
+    let mismatch = event
+        .findings
+        .iter()
+        .find(|f| f.rule_id == "response.contract_mismatch")?;
 
     let method = event.method.to_ascii_uppercase();
     let normalized_path = normalize_runtime_path(&canonical_security_path(&event.path));
@@ -601,15 +655,15 @@ pub fn build_response_contract_from_mismatch_event(
                     expected_content_type_prefix = Some(value.to_string());
                 }
             }
-        } else if evidence.location == "response.contract.missing_headers" {
-            if !evidence.value_preview.trim().is_empty() {
-                required_headers = evidence
-                    .value_preview
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-            }
+        } else if evidence.location == "response.contract.missing_headers"
+            && !evidence.value_preview.trim().is_empty()
+        {
+            required_headers = evidence
+                .value_preview
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
     }
 
@@ -641,17 +695,19 @@ pub fn evaluate_release_guard(
 ) -> crate::types::ReleaseGuardResult {
     let mut reasons = Vec::new();
 
-    let contracts = storage::query_response_contracts(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
-    let release_states = storage::query_managed_spec_release_state(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
+    let contracts =
+        storage::query_response_contracts(&state.config.storage.sqlite_path).unwrap_or_default();
+    let release_states =
+        storage::query_managed_spec_release_state(&state.config.storage.sqlite_path)
+            .unwrap_or_default();
 
-    let has_contract = contracts.iter().any(|c| {
-        c.method.eq_ignore_ascii_case(method) && c.normalized_path == normalized_path
-    });
-    let current_channel = release_states.iter().find(|s| {
-        s.method.eq_ignore_ascii_case(method) && s.normalized_path == normalized_path
-    }).map(|s| s.channel.as_str());
+    let has_contract = contracts
+        .iter()
+        .any(|c| c.method.eq_ignore_ascii_case(method) && c.normalized_path == normalized_path);
+    let current_channel = release_states
+        .iter()
+        .find(|s| s.method.eq_ignore_ascii_case(method) && s.normalized_path == normalized_path)
+        .map(|s| s.channel.as_str());
 
     if target_channel == "exported" {
         if !has_contract {
@@ -671,12 +727,13 @@ pub fn evaluate_release_guard(
 }
 
 pub fn export_kong_inventory(state: &AppState) -> crate::types::KongRouteExport {
-    let managed_routes = storage::query_managed_spec_routes(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
-    let contracts = storage::query_response_contracts(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
-    let release_states = storage::query_managed_spec_release_state(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
+    let managed_routes =
+        storage::query_managed_spec_routes(&state.config.storage.sqlite_path).unwrap_or_default();
+    let contracts =
+        storage::query_response_contracts(&state.config.storage.sqlite_path).unwrap_or_default();
+    let release_states =
+        storage::query_managed_spec_release_state(&state.config.storage.sqlite_path)
+            .unwrap_or_default();
 
     let services = managed_routes
         .into_iter()
@@ -685,21 +742,29 @@ pub fn export_kong_inventory(state: &AppState) -> crate::types::KongRouteExport 
                 c.method.eq_ignore_ascii_case(&route.method)
                     && c.normalized_path == route.normalized_path
             });
-            let release_channel = release_states.iter().find(|s| {
-                s.method.eq_ignore_ascii_case(&route.method)
-                    && s.normalized_path == route.normalized_path
-            }).map(|s| s.channel.clone());
+            let release_channel = release_states
+                .iter()
+                .find(|s| {
+                    s.method.eq_ignore_ascii_case(&route.method)
+                        && s.normalized_path == route.normalized_path
+                })
+                .map(|s| s.channel.clone());
 
             crate::types::KongServiceExport {
                 name: format!(
                     "{}-{}",
                     route.method.to_ascii_lowercase(),
-                    route.normalized_path.replace('/', "-").replace('{', "").replace('}', "")
+                    route
+                        .normalized_path
+                        .replace('/', "-")
+                        .replace(['{', '}'], "")
                 ),
                 method: route.method,
                 path: route.normalized_path,
                 auth_required: route.auth_required,
-                required_headers: contract.map(|c| c.required_headers.clone()).unwrap_or_default(),
+                required_headers: contract
+                    .map(|c| c.required_headers.clone())
+                    .unwrap_or_default(),
                 release_channel,
             }
         })
@@ -713,18 +778,22 @@ pub fn export_kong_inventory(state: &AppState) -> crate::types::KongRouteExport 
 }
 
 pub fn export_envoy_inventory(state: &AppState) -> crate::types::EnvoyRouteExport {
-    let managed_routes = storage::query_managed_spec_routes(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
-    let release_states = storage::query_managed_spec_release_state(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
+    let managed_routes =
+        storage::query_managed_spec_routes(&state.config.storage.sqlite_path).unwrap_or_default();
+    let release_states =
+        storage::query_managed_spec_release_state(&state.config.storage.sqlite_path)
+            .unwrap_or_default();
 
     let routes = managed_routes
         .into_iter()
         .map(|route| {
-            let release_channel = release_states.iter().find(|s| {
-                s.method.eq_ignore_ascii_case(&route.method)
-                    && s.normalized_path == route.normalized_path
-            }).map(|s| s.channel.clone());
+            let release_channel = release_states
+                .iter()
+                .find(|s| {
+                    s.method.eq_ignore_ascii_case(&route.method)
+                        && s.normalized_path == route.normalized_path
+                })
+                .map(|s| s.channel.clone());
 
             crate::types::EnvoyRouteRecord {
                 match_path: route.normalized_path,
@@ -745,16 +814,18 @@ pub fn export_envoy_inventory(state: &AppState) -> crate::types::EnvoyRouteExpor
 pub fn build_contract_recommendations(state: &AppState) -> crate::types::ContractRecommendationSet {
     use std::collections::HashMap;
 
-    let events = storage::recent_response_contract_mismatch_events(
-        &state.config.storage.sqlite_path,
-        200,
-    ).unwrap_or_default();
+    let events =
+        storage::recent_response_contract_mismatch_events(&state.config.storage.sqlite_path, 200)
+            .unwrap_or_default();
 
     let mut grouped: HashMap<(String, String), Vec<crate::types::SecurityEvent>> = HashMap::new();
     for event in events {
         let method = event.method.to_ascii_uppercase();
         let normalized_path = normalize_runtime_path(&canonical_security_path(&event.path));
-        grouped.entry((method, normalized_path)).or_default().push(event);
+        grouped
+            .entry((method, normalized_path))
+            .or_default()
+            .push(event);
     }
 
     let mut items = Vec::new();
@@ -764,7 +835,11 @@ pub fn build_contract_recommendations(state: &AppState) -> crate::types::Contrac
         let mut header_counts: HashMap<String, usize> = HashMap::new();
 
         for event in &group {
-            if let Some(finding) = event.findings.iter().find(|f| f.rule_id == "response.contract_mismatch") {
+            if let Some(finding) = event
+                .findings
+                .iter()
+                .find(|f| f.rule_id == "response.contract_mismatch")
+            {
                 for evidence in &finding.evidence {
                     if evidence.location == "response.contract.status" {
                         if let Some(raw) = evidence.value_preview.split(',').next() {
@@ -781,7 +856,12 @@ pub fn build_contract_recommendations(state: &AppState) -> crate::types::Contrac
                             }
                         }
                     } else if evidence.location == "response.contract.missing_headers" {
-                        for header in evidence.value_preview.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                        for header in evidence
+                            .value_preview
+                            .split(',')
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                        {
                             *header_counts.entry(header.to_string()).or_insert(0) += 1;
                         }
                     }
@@ -790,12 +870,20 @@ pub fn build_contract_recommendations(state: &AppState) -> crate::types::Contrac
         }
 
         let recommended_status = status_counts
-            .into_iter().max_by_key(|(_, c)| *c).map(|(s, _)| s).unwrap_or(200);
+            .into_iter()
+            .max_by_key(|(_, c)| *c)
+            .map(|(s, _)| s)
+            .unwrap_or(200);
         let recommended_content_type_prefix = content_type_counts
-            .into_iter().max_by_key(|(_, c)| *c).map(|(v, _)| v)
+            .into_iter()
+            .max_by_key(|(_, c)| *c)
+            .map(|(v, _)| v)
             .unwrap_or_else(|| "application/json".to_string());
         let recommended_required_headers = header_counts
-            .into_iter().filter(|(_, c)| *c >= 1).map(|(h, _)| h).collect();
+            .into_iter()
+            .filter(|(_, c)| *c >= 1)
+            .map(|(h, _)| h)
+            .collect();
 
         items.push(crate::types::ContractRecommendation {
             method,
@@ -846,12 +934,13 @@ pub fn is_valid_release_transition(current: Option<&str>, target: &str) -> bool 
 pub fn export_api_gateway_policy_inventory(
     state: &AppState,
 ) -> crate::types::ApiGatewayPolicyExport {
-    let managed_routes = storage::query_managed_spec_routes(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
-    let contracts = storage::query_response_contracts(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
-    let release_states = storage::query_managed_spec_release_state(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
+    let managed_routes =
+        storage::query_managed_spec_routes(&state.config.storage.sqlite_path).unwrap_or_default();
+    let contracts =
+        storage::query_response_contracts(&state.config.storage.sqlite_path).unwrap_or_default();
+    let release_states =
+        storage::query_managed_spec_release_state(&state.config.storage.sqlite_path)
+            .unwrap_or_default();
 
     let routes = managed_routes
         .into_iter()
@@ -860,16 +949,21 @@ pub fn export_api_gateway_policy_inventory(
                 c.method.eq_ignore_ascii_case(&route.method)
                     && c.normalized_path == route.normalized_path
             });
-            let release_channel = release_states.iter().find(|s| {
-                s.method.eq_ignore_ascii_case(&route.method)
-                    && s.normalized_path == route.normalized_path
-            }).map(|s| s.channel.clone());
+            let release_channel = release_states
+                .iter()
+                .find(|s| {
+                    s.method.eq_ignore_ascii_case(&route.method)
+                        && s.normalized_path == route.normalized_path
+                })
+                .map(|s| s.channel.clone());
 
             crate::types::ApiGatewayPolicyRoute {
                 method: route.method,
                 path: route.normalized_path,
                 auth_required: route.auth_required,
-                required_headers: contract.map(|c| c.required_headers.clone()).unwrap_or_default(),
+                required_headers: contract
+                    .map(|c| c.required_headers.clone())
+                    .unwrap_or_default(),
                 release_channel,
             }
         })
@@ -886,21 +980,27 @@ pub fn export_manifest(state: &AppState) -> crate::types::ExportManifest {
     crate::types::ExportManifest {
         exported_at: chrono::Utc::now(),
         managed_routes: storage::query_managed_spec_routes(&state.config.storage.sqlite_path)
-            .unwrap_or_default().len(),
+            .unwrap_or_default()
+            .len(),
         response_contracts: storage::query_response_contracts(&state.config.storage.sqlite_path)
-            .unwrap_or_default().len(),
-        release_state_records: storage::query_managed_spec_release_state(&state.config.storage.sqlite_path)
-            .unwrap_or_default().len(),
+            .unwrap_or_default()
+            .len(),
+        release_state_records: storage::query_managed_spec_release_state(
+            &state.config.storage.sqlite_path,
+        )
+        .unwrap_or_default()
+        .len(),
         policy_bundles: storage::query_policy_bundles(&state.config.storage.sqlite_path)
-            .unwrap_or_default().len(),
+            .unwrap_or_default()
+            .len(),
     }
 }
 
 pub fn export_gateway_routing_only_inventory(
     state: &AppState,
 ) -> crate::types::GatewayRoutingOnlyExport {
-    let managed_routes = storage::query_managed_spec_routes(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
+    let managed_routes =
+        storage::query_managed_spec_routes(&state.config.storage.sqlite_path).unwrap_or_default();
 
     let routes = managed_routes
         .into_iter()
@@ -921,12 +1021,13 @@ pub fn export_gateway_routing_only_inventory(
 pub fn export_gateway_enforcement_inventory(
     state: &AppState,
 ) -> crate::types::GatewayEnforcementExport {
-    let managed_routes = storage::query_managed_spec_routes(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
-    let contracts = storage::query_response_contracts(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
-    let release_states = storage::query_managed_spec_release_state(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
+    let managed_routes =
+        storage::query_managed_spec_routes(&state.config.storage.sqlite_path).unwrap_or_default();
+    let contracts =
+        storage::query_response_contracts(&state.config.storage.sqlite_path).unwrap_or_default();
+    let release_states =
+        storage::query_managed_spec_release_state(&state.config.storage.sqlite_path)
+            .unwrap_or_default();
 
     let routes = managed_routes
         .into_iter()
@@ -935,18 +1036,24 @@ pub fn export_gateway_enforcement_inventory(
                 c.method.eq_ignore_ascii_case(&route.method)
                     && c.normalized_path == route.normalized_path
             });
-            let release_channel = release_states.iter().find(|s| {
-                s.method.eq_ignore_ascii_case(&route.method)
-                    && s.normalized_path == route.normalized_path
-            }).map(|s| s.channel.clone());
+            let release_channel = release_states
+                .iter()
+                .find(|s| {
+                    s.method.eq_ignore_ascii_case(&route.method)
+                        && s.normalized_path == route.normalized_path
+                })
+                .map(|s| s.channel.clone());
 
             crate::types::GatewayEnforcementRoute {
                 method: route.method,
                 path: route.normalized_path,
                 auth_required: route.auth_required,
                 expected_status: contract.map(|c| c.expected_status),
-                expected_content_type_prefix: contract.map(|c| c.expected_content_type_prefix.clone()),
-                required_headers: contract.map(|c| c.required_headers.clone()).unwrap_or_default(),
+                expected_content_type_prefix: contract
+                    .map(|c| c.expected_content_type_prefix.clone()),
+                required_headers: contract
+                    .map(|c| c.required_headers.clone())
+                    .unwrap_or_default(),
                 release_channel,
             }
         })
@@ -981,22 +1088,25 @@ pub fn record_restore_refusal(
 pub fn export_enforcement_managed_spec_inventory(
     state: &AppState,
 ) -> crate::types::EnforcementManagedSpecExport {
-    let managed_routes = storage::query_managed_spec_routes(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
-    let contracts = storage::query_response_contracts(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
+    let managed_routes =
+        storage::query_managed_spec_routes(&state.config.storage.sqlite_path).unwrap_or_default();
+    let contracts =
+        storage::query_response_contracts(&state.config.storage.sqlite_path).unwrap_or_default();
 
     let routes = managed_routes
         .into_iter()
         .map(|route| {
-            let expected_response = contracts.iter().find(|contract| {
-                contract.method.eq_ignore_ascii_case(&route.method)
-                    && contract.normalized_path == route.normalized_path
-            }).map(|contract| crate::types::EnforcementResponseContract {
-                expected_status: contract.expected_status,
-                expected_content_type_prefix: contract.expected_content_type_prefix.clone(),
-                required_headers: contract.required_headers.clone(),
-            });
+            let expected_response = contracts
+                .iter()
+                .find(|contract| {
+                    contract.method.eq_ignore_ascii_case(&route.method)
+                        && contract.normalized_path == route.normalized_path
+                })
+                .map(|contract| crate::types::EnforcementResponseContract {
+                    expected_status: contract.expected_status,
+                    expected_content_type_prefix: contract.expected_content_type_prefix.clone(),
+                    required_headers: contract.required_headers.clone(),
+                });
 
             crate::types::EnforcementManagedRoute {
                 method: route.method,
@@ -1034,10 +1144,12 @@ pub fn compute_live_policy_digest(export: &crate::types::LivePolicyExport) -> St
     use sha2::{Digest, Sha256};
 
     let canonical = json!({
+        "policy_mode": export.policy_mode,
         "global_rule_modes": canonical_rule_modes(&export.global_rule_modes),
         "route_overrides": canonical_route_overrides(&export.route_overrides),
         "route_rate_limits": canonical_route_rate_limits(&export.route_rate_limits),
         "route_behavior_overrides": canonical_route_behavior_overrides(&export.route_behavior_overrides),
+        "detector_exceptions": canonical_detector_exceptions(&export.detector_exceptions),
     });
 
     let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
@@ -1067,8 +1179,14 @@ fn canonical_route_overrides(items: &[crate::config::RoutePolicyOverride]) -> Ve
         })
         .collect();
     rows.sort_by(|a, b| {
-        let a_p = a.get("path_prefix").and_then(|v| v.as_str()).unwrap_or_default();
-        let b_p = b.get("path_prefix").and_then(|v| v.as_str()).unwrap_or_default();
+        let a_p = a
+            .get("path_prefix")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let b_p = b
+            .get("path_prefix")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         a_p.cmp(b_p)
     });
     rows
@@ -1077,36 +1195,165 @@ fn canonical_route_overrides(items: &[crate::config::RoutePolicyOverride]) -> Ve
 fn canonical_route_rate_limits(items: &[crate::config::RouteRateLimitOverride]) -> Vec<Value> {
     let mut rows: Vec<Value> = items
         .iter()
-        .map(|item| json!({
-            "path_prefix": item.path_prefix,
-            "requests_per_window": item.requests_per_window,
-            "window_secs": item.window_secs,
-        }))
+        .map(|item| {
+            json!({
+                "path_prefix": item.path_prefix,
+                "requests_per_window": item.requests_per_window,
+                "window_secs": item.window_secs,
+            })
+        })
         .collect();
     rows.sort_by(|a, b| {
-        let a_p = a.get("path_prefix").and_then(|v| v.as_str()).unwrap_or_default();
-        let b_p = b.get("path_prefix").and_then(|v| v.as_str()).unwrap_or_default();
+        let a_p = a
+            .get("path_prefix")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let b_p = b
+            .get("path_prefix")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         a_p.cmp(b_p)
     });
     rows
 }
 
-fn canonical_route_behavior_overrides(items: &[crate::config::RouteBehaviorOverride]) -> Vec<Value> {
+fn canonical_route_behavior_overrides(
+    items: &[crate::config::RouteBehaviorOverride],
+) -> Vec<Value> {
     let mut rows: Vec<Value> = items
         .iter()
-        .map(|item| json!({
-            "path_prefix": item.path_prefix,
-            "warmup_min_samples": item.warmup_min_samples,
-            "object_enumeration_threshold": item.object_enumeration_threshold,
-            "object_window_secs": item.object_window_secs,
-        }))
+        .map(|item| {
+            json!({
+                "path_prefix": item.path_prefix,
+                "warmup_min_samples": item.warmup_min_samples,
+                "object_enumeration_threshold": item.object_enumeration_threshold,
+                "object_window_secs": item.object_window_secs,
+            })
+        })
         .collect();
     rows.sort_by(|a, b| {
-        let a_p = a.get("path_prefix").and_then(|v| v.as_str()).unwrap_or_default();
-        let b_p = b.get("path_prefix").and_then(|v| v.as_str()).unwrap_or_default();
+        let a_p = a
+            .get("path_prefix")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let b_p = b
+            .get("path_prefix")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         a_p.cmp(b_p)
     });
     rows
+}
+
+fn canonical_detector_exceptions(items: &[crate::config::DetectorException]) -> Vec<Value> {
+    let mut rows: Vec<Value> = items
+        .iter()
+        .map(|item| {
+            json!({
+                "detector_id": item.detector_id,
+                "path_prefix": item.path_prefix,
+                "parameter": item.parameter,
+                "min_confidence": item.min_confidence,
+                "monitor_only": item.monitor_only,
+                "reason": item.reason,
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        let a_id = a
+            .get("detector_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let b_id = b
+            .get("detector_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        a_id.cmp(b_id)
+    });
+    rows
+}
+
+pub fn validate_live_policy_import(
+    import: &crate::types::LivePolicyImportRequest,
+) -> anyhow::Result<()> {
+    for rule_id in import.global_rule_modes.keys() {
+        validate_detector_id(rule_id)?;
+    }
+
+    for route in &import.route_overrides {
+        validate_path_prefix(&route.path_prefix)?;
+        for rule_id in route.rule_modes.keys() {
+            validate_detector_id(rule_id)?;
+        }
+    }
+
+    for route in &import.route_rate_limits {
+        validate_path_prefix(&route.path_prefix)?;
+        if route.requests_per_window == 0 || route.requests_per_window > 1_000_000 {
+            anyhow::bail!("route rate limit requests_per_window is invalid");
+        }
+        if route.window_secs == 0 || route.window_secs > 86_400 {
+            anyhow::bail!("route rate limit window_secs is invalid");
+        }
+    }
+
+    for route in &import.route_behavior_overrides {
+        validate_path_prefix(&route.path_prefix)?;
+        if route.object_enumeration_threshold == Some(0) {
+            anyhow::bail!("object_enumeration_threshold must be positive");
+        }
+        if route.object_window_secs == Some(0) {
+            anyhow::bail!("object_window_secs must be positive");
+        }
+    }
+
+    for exception in &import.detector_exceptions {
+        validate_detector_id(&exception.detector_id)?;
+        if let Some(path_prefix) = &exception.path_prefix {
+            validate_path_prefix(path_prefix)?;
+        }
+        if let Some(confidence) = exception.min_confidence {
+            if !(0.0..=1.0).contains(&confidence) {
+                anyhow::bail!("detector exception min_confidence must be between 0 and 1");
+            }
+        }
+        if let Some(parameter) = &exception.parameter {
+            validate_parameter_selector(parameter)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_detector_id(rule_id: &str) -> anyhow::Result<()> {
+    if rule_id.is_empty()
+        || rule_id.len() > 80
+        || !rule_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        anyhow::bail!("detector ID is invalid");
+    }
+    Ok(())
+}
+
+fn validate_path_prefix(path_prefix: &str) -> anyhow::Result<()> {
+    if !path_prefix.starts_with('/') || path_prefix.len() > 512 || path_prefix.contains("..") {
+        anyhow::bail!("route path_prefix is invalid");
+    }
+    Ok(())
+}
+
+fn validate_parameter_selector(parameter: &str) -> anyhow::Result<()> {
+    if parameter.is_empty()
+        || parameter.len() > 120
+        || !parameter
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        anyhow::bail!("detector exception parameter selector is invalid");
+    }
+    Ok(())
 }
 
 pub fn verify_policy_bundle(
@@ -1132,9 +1379,9 @@ pub fn verify_policy_bundle(
 
 pub fn is_source_allowlisted_for_path(state: &AppState, source_ip: &str, path: &str) -> bool {
     match storage::query_scoped_source_allowlist(&state.config.storage.sqlite_path) {
-        Ok(items) => items.iter().any(|entry| {
-            entry.source_ip == source_ip && path.starts_with(&entry.path_prefix)
-        }),
+        Ok(items) => items
+            .iter()
+            .any(|entry| entry.source_ip == source_ip && path.starts_with(&entry.path_prefix)),
         Err(_) => false,
     }
 }
@@ -1172,7 +1419,9 @@ pub fn is_source_allowlisted(state: &AppState, source_ip: &str) -> bool {
 
 pub fn is_principal_allowlisted(state: &AppState, principal_key: &str) -> bool {
     match storage::query_principal_allowlist(&state.config.storage.sqlite_path) {
-        Ok(items) => items.iter().any(|entry| principal_key.starts_with(&entry.principal_prefix)),
+        Ok(items) => items
+            .iter()
+            .any(|entry| principal_key.starts_with(&entry.principal_prefix)),
         Err(_) => false,
     }
 }
@@ -1190,13 +1439,18 @@ pub fn compute_policy_diff(
         compared_at: chrono::Utc::now(),
         bundle_id,
         has_changes: live.global_rule_modes != saved.global_rule_modes
+            || live.policy_mode != saved.policy_mode
             || live.route_overrides != saved.route_overrides
             || live.route_rate_limits != saved.route_rate_limits
-            || live.route_behavior_overrides != saved.route_behavior_overrides,
+            || live.route_behavior_overrides != saved.route_behavior_overrides
+            || live.detector_exceptions != saved.detector_exceptions,
         global_rule_modes_changed: live.global_rule_modes != saved.global_rule_modes,
+        policy_mode_changed: live.policy_mode != saved.policy_mode,
         route_overrides_changed: live.route_overrides != saved.route_overrides,
         route_rate_limits_changed: live.route_rate_limits != saved.route_rate_limits,
-        route_behavior_overrides_changed: live.route_behavior_overrides != saved.route_behavior_overrides,
+        route_behavior_overrides_changed: live.route_behavior_overrides
+            != saved.route_behavior_overrides,
+        detector_exceptions_changed: live.detector_exceptions != saved.detector_exceptions,
     }
 }
 
@@ -1207,8 +1461,7 @@ pub fn response_contract_for_route(
 ) -> Option<crate::types::ResponseContract> {
     match storage::query_response_contracts(&state.config.storage.sqlite_path) {
         Ok(items) => items.into_iter().find(|item| {
-            item.method.eq_ignore_ascii_case(method)
-                && item.normalized_path == normalized_path
+            item.method.eq_ignore_ascii_case(method) && item.normalized_path == normalized_path
         }),
         Err(_) => None,
     }
@@ -1219,10 +1472,14 @@ pub fn export_live_policy_state(state: &AppState) -> crate::types::LivePolicyExp
 
     crate::types::LivePolicyExport {
         exported_at: chrono::Utc::now(),
+        version: guard.version,
+        previous_version: guard.previous_version,
+        policy_mode: guard.policy_mode.clone(),
         global_rule_modes: guard.global_rule_modes.clone(),
         route_overrides: guard.route_overrides.clone(),
         route_rate_limits: guard.route_rate_limits.clone(),
         route_behavior_overrides: guard.route_behavior_overrides.clone(),
+        detector_exceptions: guard.detector_exceptions.clone(),
     }
 }
 
@@ -1231,7 +1488,8 @@ pub fn filter_suppressed_findings(
     path: &str,
     findings: Vec<crate::types::Finding>,
 ) -> Vec<crate::types::Finding> {
-    let suppressions = match storage::query_analyst_suppressions(&state.config.storage.sqlite_path) {
+    let suppressions = match storage::query_analyst_suppressions(&state.config.storage.sqlite_path)
+    {
         Ok(items) => items,
         Err(_) => return findings,
     };
@@ -1350,9 +1608,9 @@ fn route_pattern_match(template: &str, path: &str) -> bool {
         return false;
     }
 
-    lhs.iter().zip(rhs.iter()).all(|(a, b)| {
-        (a.starts_with('{') && a.ends_with('}')) || a.eq_ignore_ascii_case(b)
-    })
+    lhs.iter()
+        .zip(rhs.iter())
+        .all(|(a, b)| (a.starts_with('{') && a.ends_with('}')) || a.eq_ignore_ascii_case(b))
 }
 
 fn unknown_route_result(
@@ -1371,7 +1629,10 @@ fn unknown_route_result(
         attack_class: AttackClass::SchemaViolation,
         severity,
         confidence: 0.93,
-        message: format!("route not present in configured API spec: {}", enriched.normalized_path),
+        message: format!(
+            "route not present in configured API spec: {}",
+            enriched.normalized_path
+        ),
         evidence: vec![FindingEvidence {
             location: "request.path".to_string(),
             value_preview: enriched.normalized_path.clone(),
@@ -1422,7 +1683,14 @@ fn severity_weight(severity: &Severity) -> f32 {
     }
 }
 
-fn remember_route(method: &str, normalized_path: &str, has_auth: bool) {
+fn remember_route(
+    state: &AppState,
+    method: &str,
+    normalized_path: &str,
+    has_auth: bool,
+    request_content_type: Option<&str>,
+    request_size_bytes: usize,
+) -> u64 {
     let now = Utc::now();
     let key = format!("{}:{}", method.to_ascii_uppercase(), normalized_path);
     let mut guard = ROUTE_MEMORY.write().expect("route memory poisoned");
@@ -1431,8 +1699,20 @@ fn remember_route(method: &str, normalized_path: &str, has_auth: bool) {
             route.last_seen = now;
             route.hits += 1;
             route.has_auth = route.has_auth || has_auth;
+            push_unique_bounded(&mut route.request_content_types, request_content_type, 8);
+            update_min_max(
+                &mut route.min_request_bytes,
+                &mut route.max_request_bytes,
+                request_size_bytes,
+            );
+            route.hits
         }
         None => {
+            if guard.len() >= state.config.discovery.max_learned_routes {
+                evict_oldest_route(&mut guard);
+            }
+            let mut request_content_types = Vec::new();
+            push_unique_bounded(&mut request_content_types, request_content_type, 8);
             guard.insert(
                 key,
                 crate::types::LearnedRoute {
@@ -1442,10 +1722,98 @@ fn remember_route(method: &str, normalized_path: &str, has_auth: bool) {
                     last_seen: now,
                     hits: 1,
                     has_auth,
+                    request_content_types,
+                    response_content_types: Vec::new(),
+                    observed_status_codes: Vec::new(),
+                    min_request_bytes: Some(request_size_bytes),
+                    max_request_bytes: Some(request_size_bytes),
+                    min_response_bytes: None,
+                    max_response_bytes: None,
+                    status: crate::types::ApiInventoryStatus::New,
                 },
             );
+            1
         }
     }
+}
+
+pub fn observe_route_response(
+    state: &AppState,
+    method: &str,
+    normalized_path: &str,
+    status_code: u16,
+    response_content_type: Option<&str>,
+    response_size_bytes: usize,
+) {
+    if !state.config.discovery.enabled {
+        return;
+    }
+
+    let key = format!("{}:{}", method.to_ascii_uppercase(), normalized_path);
+    let mut guard = ROUTE_MEMORY.write().expect("route memory poisoned");
+    if let Some(route) = guard.get_mut(&key) {
+        if !route.observed_status_codes.contains(&status_code) {
+            route.observed_status_codes.push(status_code);
+            route.observed_status_codes.sort_unstable();
+            route.observed_status_codes.truncate(16);
+        }
+        push_unique_bounded(&mut route.response_content_types, response_content_type, 8);
+        update_min_max(
+            &mut route.min_response_bytes,
+            &mut route.max_response_bytes,
+            response_size_bytes,
+        );
+        if matches!(route.status, crate::types::ApiInventoryStatus::New)
+            && route.hits >= state.config.discovery.shadow_min_hits
+        {
+            route.status = crate::types::ApiInventoryStatus::Known;
+        }
+    }
+}
+
+pub fn is_deprecated_route(state: &AppState, method: &str, normalized_path: &str) -> bool {
+    storage::query_managed_spec_release_state(&state.config.storage.sqlite_path)
+        .map(|items| {
+            items.iter().any(|item| {
+                item.method.eq_ignore_ascii_case(method)
+                    && item.normalized_path == normalized_path
+                    && item.channel.eq_ignore_ascii_case("deprecated")
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn evict_oldest_route(routes: &mut std::collections::HashMap<String, crate::types::LearnedRoute>) {
+    let victim = routes
+        .iter()
+        .min_by_key(|(_, route)| route.last_seen)
+        .map(|(key, _)| key.clone());
+    if let Some(key) = victim {
+        routes.remove(&key);
+    }
+}
+
+fn push_unique_bounded(values: &mut Vec<String>, value: Option<&str>, max: usize) {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+
+    if values
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(value))
+    {
+        return;
+    }
+
+    if values.len() >= max {
+        values.remove(0);
+    }
+    values.push(value.to_ascii_lowercase());
+}
+
+fn update_min_max(min: &mut Option<usize>, max: &mut Option<usize>, value: usize) {
+    *min = Some(min.map(|current| current.min(value)).unwrap_or(value));
+    *max = Some(max.map(|current| current.max(value)).unwrap_or(value));
 }
 
 fn extract_object_id_candidates(request: &RequestContext) -> Vec<String> {

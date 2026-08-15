@@ -49,6 +49,11 @@ pub struct SecurityEventIngestPayload {
     pub user_agent: Option<String>,
     pub country: Option<String>,
     pub confidence: Option<f32>,
+    pub detector_id: Option<String>,
+    pub detector_ids: Vec<String>,
+    pub score: Option<f32>,
+    pub api_route_id: Option<String>,
+    pub anomaly_type: Option<String>,
     pub action_taken: String,
     pub request_id: Option<String>,
     pub raw_metadata: serde_json::Value,
@@ -59,7 +64,11 @@ pub struct SecurityEventIngestPayload {
 #[serde(rename_all = "camelCase")]
 struct SecurityEventMetadata {
     rule_ids: Vec<String>,
+    detector_ids: Vec<String>,
     attack_classes: Vec<String>,
+    categories: Vec<String>,
+    scores: Vec<f32>,
+    normalized_route: Option<String>,
     finding_count: usize,
     risk_score: f32,
     outcome: String,
@@ -203,6 +212,16 @@ pub fn map_security_event(
         .iter()
         .map(|finding| finding.confidence)
         .reduce(f32::max);
+    let primary = event.findings.iter().max_by(|a, b| {
+        a.score()
+            .partial_cmp(&b.score())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let detector_ids: Vec<String> = event
+        .findings
+        .iter()
+        .map(|finding| finding.detector_id().to_string())
+        .collect();
 
     SecurityEventIngestPayload {
         firewall_instance_id: firewall_instance_id.to_owned(),
@@ -215,6 +234,11 @@ pub fn map_security_event(
         user_agent: None,
         country: None,
         confidence,
+        detector_id: primary.map(|finding| finding.detector_id().to_string()),
+        detector_ids: detector_ids.clone(),
+        score: primary.map(|finding| finding.score()),
+        api_route_id: event.normalized_route.clone(),
+        anomaly_type: primary.map(|finding| finding.category().to_string()),
         action_taken: action_taken(event),
         request_id: Some(event.request_id.clone()),
         raw_metadata: serde_json::to_value(SecurityEventMetadata {
@@ -223,11 +247,23 @@ pub fn map_security_event(
                 .iter()
                 .map(|finding| finding.rule_id.clone())
                 .collect(),
+            detector_ids,
             attack_classes: event
                 .findings
                 .iter()
                 .map(|finding| attack_class_name(&finding.attack_class))
                 .collect(),
+            categories: event
+                .findings
+                .iter()
+                .map(|finding| finding.category().to_string())
+                .collect(),
+            scores: event
+                .findings
+                .iter()
+                .map(|finding| finding.score())
+                .collect(),
+            normalized_route: event.normalized_route.clone(),
             finding_count: event.findings.len(),
             risk_score: event.decision.risk_score,
             outcome: outcome_name(&event.decision.outcome),
@@ -383,6 +419,10 @@ fn attack_class_name(class: &AttackClass) -> String {
         AttackClass::ResponseLeak => "response_leak",
         AttackClass::ShadowApi => "shadow_api",
         AttackClass::TenantBoundaryViolation => "tenant_boundary_violation",
+        AttackClass::ApiInventory => "api_inventory",
+        AttackClass::AuthAbuse => "credential_attack",
+        AttackClass::ResourceAbuse => "resource_abuse",
+        AttackClass::SecurityMisconfiguration => "security_misconfiguration",
     }
     .to_string()
 }
@@ -488,6 +528,7 @@ mod tests {
             source_ip: "203.0.113.10".to_string(),
             method: "POST".to_string(),
             path: "/api/orders".to_string(),
+            normalized_route: Some("/api/{id}".to_string()),
             findings: vec![Finding {
                 rule_id: "sqli.basic".to_string(),
                 attack_class: AttackClass::SqlInjection,

@@ -231,7 +231,10 @@ pub fn finalize_blocking_decision(
     }
 
     let (status, body) = match &decision.outcome {
-        DecisionOutcome::Reject { status_code, message } => {
+        DecisionOutcome::Reject {
+            status_code,
+            message,
+        } => {
             let status = StatusCode::from_u16(*status_code).unwrap_or(StatusCode::FORBIDDEN);
             (status, message.clone())
         }
@@ -318,9 +321,7 @@ pub fn demo_recommendations() -> Vec<Recommendation> {
             rationale: "Analyst confirmed source is benign.".to_string(),
             risk: "Low — clears accumulated score only.".to_string(),
             rollback_hint: "Score will re-accumulate on future violations.".to_string(),
-            parameters: hashmap(vec![
-                ("source_ip".to_string(), "127.0.0.1".to_string()),
-            ]),
+            parameters: hashmap(vec![("source_ip".to_string(), "127.0.0.1".to_string())]),
         },
     ]
 }

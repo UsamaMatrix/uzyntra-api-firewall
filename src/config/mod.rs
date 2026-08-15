@@ -56,10 +56,50 @@ pub struct SecurityConfig {
     pub suspicious_score_threshold: i32,
     pub rate_limit: RateLimitConfig,
     pub rule_modes: HashMap<String, RuleMode>,
+    #[serde(default)]
+    pub policy_mode: PolicyMode,
+    #[serde(default = "default_min_block_confidence")]
+    pub min_block_confidence: f32,
+    #[serde(default = "default_min_block_score")]
+    pub min_block_score: f32,
+    #[serde(default)]
+    pub detector_exceptions: Vec<DetectorException>,
     pub route_overrides: Vec<RoutePolicyOverride>,
     pub route_rate_limits: Vec<RouteRateLimitOverride>,
     #[serde(default)]
     pub route_behavior_overrides: Vec<RouteBehaviorOverride>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyMode {
+    Monitor,
+    #[default]
+    Balanced,
+    Strict,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DetectorException {
+    pub detector_id: String,
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    #[serde(default)]
+    pub parameter: Option<String>,
+    #[serde(default)]
+    pub min_confidence: Option<f32>,
+    #[serde(default)]
+    pub monitor_only: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+fn default_min_block_confidence() -> f32 {
+    0.85
+}
+
+fn default_min_block_score() -> f32 {
+    65.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,18 +231,13 @@ pub struct AdminAuthConfig {
     pub token: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleMode {
+    #[default]
     DetectOnly,
     Recommend,
     Block,
-}
-
-impl Default for RuleMode {
-    fn default() -> Self {
-        Self::DetectOnly
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -361,6 +396,16 @@ pub struct BehaviorConfig {
     pub object_enumeration_threshold: usize,
     #[serde(default = "default_object_window_secs")]
     pub object_window_secs: u64,
+    #[serde(default = "default_auth_attempt_window_secs")]
+    pub auth_attempt_window_secs: u64,
+    #[serde(default = "default_auth_bruteforce_threshold")]
+    pub auth_bruteforce_threshold: usize,
+    #[serde(default = "default_password_spray_threshold")]
+    pub password_spray_threshold: usize,
+    #[serde(default = "default_behavior_max_entries")]
+    pub max_entries: usize,
+    #[serde(default = "default_behavior_max_ids_per_entry")]
+    pub max_ids_per_entry: usize,
 }
 
 impl Default for BehaviorConfig {
@@ -372,6 +417,11 @@ impl Default for BehaviorConfig {
             warmup_min_samples: default_warmup_min_samples(),
             object_enumeration_threshold: default_object_enumeration_threshold(),
             object_window_secs: default_object_window_secs(),
+            auth_attempt_window_secs: default_auth_attempt_window_secs(),
+            auth_bruteforce_threshold: default_auth_bruteforce_threshold(),
+            password_spray_threshold: default_password_spray_threshold(),
+            max_entries: default_behavior_max_entries(),
+            max_ids_per_entry: default_behavior_max_ids_per_entry(),
         }
     }
 }
@@ -394,6 +444,26 @@ fn default_object_enumeration_threshold() -> usize {
 
 fn default_object_window_secs() -> u64 {
     300
+}
+
+fn default_auth_attempt_window_secs() -> u64 {
+    300
+}
+
+fn default_auth_bruteforce_threshold() -> usize {
+    8
+}
+
+fn default_password_spray_threshold() -> usize {
+    5
+}
+
+fn default_behavior_max_entries() -> usize {
+    10_000
+}
+
+fn default_behavior_max_ids_per_entry() -> usize {
+    128
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -422,6 +492,24 @@ pub struct DiscoveryConfig {
     pub enabled: bool,
     #[serde(default = "default_shadow_min_hits")]
     pub shadow_min_hits: u64,
+    #[serde(default = "default_max_learned_routes")]
+    pub max_learned_routes: usize,
+    #[serde(default = "default_schema_min_samples")]
+    pub schema_min_samples: u64,
+    #[serde(default = "default_max_schema_routes")]
+    pub max_schema_routes: usize,
+    #[serde(default = "default_max_schema_fields")]
+    pub max_schema_fields: usize,
+    #[serde(default = "default_max_json_depth")]
+    pub max_json_depth: usize,
+    #[serde(default = "default_max_json_array_len")]
+    pub max_json_array_len: usize,
+    #[serde(default = "default_max_query_params")]
+    pub max_query_params: usize,
+    #[serde(default = "default_max_normalized_bytes")]
+    pub max_normalized_bytes: usize,
+    #[serde(default = "default_max_decode_passes")]
+    pub max_decode_passes: usize,
 }
 
 impl Default for DiscoveryConfig {
@@ -429,12 +517,57 @@ impl Default for DiscoveryConfig {
         Self {
             enabled: false,
             shadow_min_hits: default_shadow_min_hits(),
+            max_learned_routes: default_max_learned_routes(),
+            schema_min_samples: default_schema_min_samples(),
+            max_schema_routes: default_max_schema_routes(),
+            max_schema_fields: default_max_schema_fields(),
+            max_json_depth: default_max_json_depth(),
+            max_json_array_len: default_max_json_array_len(),
+            max_query_params: default_max_query_params(),
+            max_normalized_bytes: default_max_normalized_bytes(),
+            max_decode_passes: default_max_decode_passes(),
         }
     }
 }
 
 fn default_shadow_min_hits() -> u64 {
     3
+}
+
+fn default_max_learned_routes() -> usize {
+    5_000
+}
+
+fn default_schema_min_samples() -> u64 {
+    5
+}
+
+fn default_max_schema_routes() -> usize {
+    2_000
+}
+
+fn default_max_schema_fields() -> usize {
+    80
+}
+
+fn default_max_json_depth() -> usize {
+    16
+}
+
+fn default_max_json_array_len() -> usize {
+    200
+}
+
+fn default_max_query_params() -> usize {
+    100
+}
+
+fn default_max_normalized_bytes() -> usize {
+    16 * 1024
+}
+
+fn default_max_decode_passes() -> usize {
+    2
 }
 
 impl AppConfig {
@@ -532,6 +665,40 @@ impl AppConfig {
     fn validate(&self) -> Result<()> {
         self.control_plane.validate()?;
 
+        if !(0.0..=1.0).contains(&self.security.min_block_confidence) {
+            bail!("security.min_block_confidence must be between 0 and 1");
+        }
+
+        if !(0.0..=100.0).contains(&self.security.min_block_score) {
+            bail!("security.min_block_score must be between 0 and 100");
+        }
+
+        for exception in &self.security.detector_exceptions {
+            if exception.detector_id.trim().is_empty() {
+                bail!("detector exception detector_id must not be empty");
+            }
+
+            if let Some(confidence) = exception.min_confidence {
+                if !(0.0..=1.0).contains(&confidence) {
+                    bail!("detector exception min_confidence must be between 0 and 1");
+                }
+            }
+
+            if let Some(parameter) = &exception.parameter {
+                validate_detector_exception_parameter(parameter)?;
+            }
+        }
+
+        if self.discovery.max_decode_passes > 4 {
+            bail!("discovery.max_decode_passes must be 4 or less");
+        }
+
+        if self.discovery.max_normalized_bytes == 0
+            || self.discovery.max_normalized_bytes > 256 * 1024
+        {
+            bail!("discovery.max_normalized_bytes must be between 1 and 262144");
+        }
+
         if !self.server.environment.eq_ignore_ascii_case("production") {
             return Ok(());
         }
@@ -568,6 +735,19 @@ impl AppConfig {
 
         Ok(())
     }
+}
+
+fn validate_detector_exception_parameter(parameter: &str) -> Result<()> {
+    if parameter.is_empty()
+        || parameter.len() > 120
+        || !parameter
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        bail!("security.detector_exceptions parameter selector is invalid");
+    }
+
+    Ok(())
 }
 
 fn parse_bool_env(value: &str) -> bool {

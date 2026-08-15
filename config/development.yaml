@@ -24,6 +24,9 @@ security:
   temp_ban_secs: 900
   temp_suspicious_secs: 300
   suspicious_score_threshold: 12
+  policy_mode: balanced
+  min_block_confidence: 0.85
+  min_block_score: 65.0
   rate_limit:
     requests_per_window: 60
     window_secs: 60
@@ -46,6 +49,13 @@ security:
     missing.x_content_type_options: detect_only
     missing.x_frame_options: detect_only
     missing.csp: detect_only
+    UZ-API-SCHEMA-001: recommend
+    UZ-API-SCHEMA-002: recommend
+    UZ-SSRF-001: recommend
+    UZ-AUTH-ABUSE-001: block
+    UZ-AUTH-ABUSE-002: block
+    UZ-API-RESOURCE-001: recommend
+    UZ-API-INV-001: detect_only
   route_overrides:
     - path_prefix: "/proxy/get"
       rule_modes:
@@ -61,6 +71,34 @@ security:
     - path_prefix: "/proxy/get"
       requests_per_window: 30
       window_secs: 60
+  route_behavior_overrides: []
+  detector_exceptions: []
+
+behavior:
+  enabled: true
+  rps_spike_threshold_z: 4.0
+  body_spike_threshold_z: 5.0
+  warmup_min_samples: 5
+  object_enumeration_threshold: 15
+  object_window_secs: 300
+  auth_attempt_window_secs: 300
+  auth_bruteforce_threshold: 8
+  password_spray_threshold: 5
+  max_entries: 10000
+  max_ids_per_entry: 128
+
+discovery:
+  enabled: true
+  shadow_min_hits: 3
+  max_learned_routes: 5000
+  schema_min_samples: 5
+  max_schema_routes: 2000
+  max_schema_fields: 80
+  max_json_depth: 16
+  max_json_array_len: 200
+  max_query_params: 100
+  max_normalized_bytes: 16384
+  max_decode_passes: 2
 
 telemetry:
   log_level: "info"

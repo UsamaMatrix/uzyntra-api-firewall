@@ -34,6 +34,7 @@ struct BehaviorState {
 
     recent_hits: VecDeque<Instant>,
     recent_object_ids: VecDeque<(Instant, String)>,
+    recent_auth_attempts: VecDeque<(Instant, String)>,
 }
 
 impl Default for BehaviorState {
@@ -47,6 +48,7 @@ impl Default for BehaviorState {
             m2_body_size: 0.0,
             recent_hits: VecDeque::new(),
             recent_object_ids: VecDeque::new(),
+            recent_auth_attempts: VecDeque::new(),
         }
     }
 }
@@ -258,6 +260,10 @@ pub fn evaluate_request_with_headers(
         findings.push(object_finding);
     }
 
+    if let Some(auth_finding) = evaluate_auth_abuse(state, context, &principal_key) {
+        findings.push(auth_finding);
+    }
+
     findings
 }
 
@@ -303,6 +309,7 @@ fn evaluate_behavior(
     let now = Instant::now();
     let body_size = context.body_preview.as_ref().map(|b| b.len()).unwrap_or(0) as f64;
 
+    enforce_behavior_capacity(state);
     let mut entry = state.rate_limiter.behavior.entry(key).or_default();
 
     purge_old_hits(&mut entry.recent_hits, now, Duration::from_secs(60));
@@ -416,6 +423,7 @@ fn evaluate_object_enumeration(
     let key = format!("{}|{}", principal_key, route_key);
     let now = Instant::now();
 
+    enforce_behavior_capacity(state);
     let mut entry = state.rate_limiter.behavior.entry(key).or_default();
 
     purge_old_object_ids(
@@ -425,6 +433,9 @@ fn evaluate_object_enumeration(
     );
     for id in ids {
         entry.recent_object_ids.push_back((now, id));
+    }
+    while entry.recent_object_ids.len() > state.config.behavior.max_ids_per_entry {
+        entry.recent_object_ids.pop_front();
     }
 
     let distinct_ids: HashSet<String> = entry
@@ -461,8 +472,144 @@ fn evaluate_object_enumeration(
     None
 }
 
+fn evaluate_auth_abuse(
+    state: &AppState,
+    context: &RequestContext,
+    principal_key: &str,
+) -> Option<Finding> {
+    if !state.config.behavior.enabled || !looks_like_auth_attempt(context) {
+        return None;
+    }
+
+    let route_key = core::normalize_runtime_path(&core::canonical_security_path(&context.path));
+    let key = format!("auth|{}|{}", context.source_ip, route_key);
+    let now = Instant::now();
+    let window = Duration::from_secs(state.config.behavior.auth_attempt_window_secs);
+    let subject = auth_subject_hint(context).unwrap_or_else(|| principal_key.to_string());
+
+    enforce_behavior_capacity(state);
+    let mut entry = state.rate_limiter.behavior.entry(key).or_default();
+    purge_old_auth_attempts(&mut entry.recent_auth_attempts, now, window);
+    entry.recent_auth_attempts.push_back((now, subject));
+
+    let attempts = entry.recent_auth_attempts.len();
+    let subjects: HashSet<String> = entry
+        .recent_auth_attempts
+        .iter()
+        .map(|(_, subject)| subject.clone())
+        .collect();
+
+    if subjects.len() >= state.config.behavior.password_spray_threshold {
+        return Some(Finding {
+            rule_id: "UZ-AUTH-ABUSE-002".to_string(),
+            attack_class: AttackClass::AuthAbuse,
+            severity: Severity::High,
+            confidence: 0.88,
+            message: format!(
+                "password-spray pattern detected ({} subjects / {}s)",
+                subjects.len(),
+                state.config.behavior.auth_attempt_window_secs
+            ),
+            evidence: vec![
+                FindingEvidence {
+                    location: "auth.source_ip".to_string(),
+                    value_preview: context.source_ip.to_string(),
+                },
+                FindingEvidence {
+                    location: "auth.distinct_subjects".to_string(),
+                    value_preview: subjects.len().to_string(),
+                },
+            ],
+            mode: resolve_rule_mode(state, &context.path, "UZ-AUTH-ABUSE-002"),
+        });
+    }
+
+    if attempts >= state.config.behavior.auth_bruteforce_threshold {
+        return Some(Finding {
+            rule_id: "UZ-AUTH-ABUSE-001".to_string(),
+            attack_class: AttackClass::AuthAbuse,
+            severity: Severity::High,
+            confidence: 0.86,
+            message: format!(
+                "authentication brute-force pattern detected ({} attempts / {}s)",
+                attempts, state.config.behavior.auth_attempt_window_secs
+            ),
+            evidence: vec![
+                FindingEvidence {
+                    location: "auth.source_ip".to_string(),
+                    value_preview: context.source_ip.to_string(),
+                },
+                FindingEvidence {
+                    location: "auth.attempt_count".to_string(),
+                    value_preview: attempts.to_string(),
+                },
+            ],
+            mode: resolve_rule_mode(state, &context.path, "UZ-AUTH-ABUSE-001"),
+        });
+    }
+
+    None
+}
+
+fn enforce_behavior_capacity(state: &AppState) {
+    let max_entries = state.config.behavior.max_entries.max(1);
+    if state.rate_limiter.behavior.len() < max_entries {
+        return;
+    }
+
+    let excess = state
+        .rate_limiter
+        .behavior
+        .len()
+        .saturating_sub(max_entries.saturating_sub(1));
+    let keys: Vec<String> = state
+        .rate_limiter
+        .behavior
+        .iter()
+        .take(excess)
+        .map(|entry| entry.key().clone())
+        .collect();
+    for key in keys {
+        state.rate_limiter.behavior.remove(&key);
+    }
+}
+
+fn looks_like_auth_attempt(context: &RequestContext) -> bool {
+    let path = context.path.to_ascii_lowercase();
+    matches!(context.method.as_str(), "POST" | "PUT" | "PATCH")
+        && (path.contains("login")
+            || path.contains("signin")
+            || path.contains("token")
+            || path.contains("oauth")
+            || path.contains("session"))
+}
+
+fn auth_subject_hint(context: &RequestContext) -> Option<String> {
+    context
+        .parsed_body_fields
+        .iter()
+        .find(|field| {
+            let key = field.key.to_ascii_lowercase();
+            matches!(
+                key.as_str(),
+                "email" | "username" | "user" | "login" | "identifier"
+            )
+        })
+        .map(|field| format!("{}={}", field.key.to_ascii_lowercase(), field.value_preview))
+}
+
 fn purge_old_hits(queue: &mut VecDeque<Instant>, now: Instant, ttl: Duration) {
     while let Some(ts) = queue.front() {
+        if now.duration_since(*ts) > ttl {
+            queue.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+fn purge_old_auth_attempts(queue: &mut VecDeque<(Instant, String)>, now: Instant, ttl: Duration) {
+    while let Some((ts, _)) = queue.front() {
         if now.duration_since(*ts) > ttl {
             queue.pop_front();
         } else {
@@ -545,4 +692,116 @@ fn is_object_id(value: &str) -> bool {
     }
 
     value.len() >= 8 && value.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        app,
+        types::{AuthStatus, ParsedBodyField},
+    };
+    use std::{net::IpAddr, str::FromStr};
+
+    #[test]
+    fn object_enumeration_triggers_only_after_unique_id_threshold() {
+        let state = test_state();
+        let principal = "ip:203.0.113.10";
+
+        assert!(
+            evaluate_object_enumeration(&state, &context("/api/users/100", "GET"), principal)
+                .is_none()
+        );
+        assert!(
+            evaluate_object_enumeration(&state, &context("/api/users/101", "GET"), principal)
+                .is_none()
+        );
+
+        let finding =
+            evaluate_object_enumeration(&state, &context("/api/users/102", "GET"), principal)
+                .expect("threshold should trigger object enumeration signal");
+
+        assert_eq!(finding.rule_id, "object.enumeration.window");
+        assert!(finding.message.contains("distinct object access"));
+    }
+
+    #[test]
+    fn auth_abuse_windows_distinguish_benign_and_spray_patterns() {
+        let state = test_state();
+        let principal = "ip:203.0.113.10";
+
+        let first = login_context("first@example.com");
+        assert!(evaluate_auth_abuse(&state, &first, principal).is_none());
+        let second = login_context("second@example.com");
+        assert!(evaluate_auth_abuse(&state, &second, principal).is_none());
+
+        let third = login_context("third@example.com");
+        let finding = evaluate_auth_abuse(&state, &third, principal)
+            .expect("third distinct subject should trigger password-spray signal");
+        assert_eq!(finding.rule_id, "UZ-AUTH-ABUSE-002");
+        assert!(!format!("{:?}", finding.evidence).contains("password"));
+    }
+
+    #[test]
+    fn behavior_state_capacity_is_enforced() {
+        let state = test_state();
+        for i in 0..5 {
+            let principal = format!("ip:203.0.113.{i}");
+            let _ = evaluate_behavior(
+                &state,
+                &context(&format!("/api/items/{i}"), "GET"),
+                &principal,
+            );
+        }
+
+        assert!(state.rate_limiter.behavior_entry_count() <= state.config.behavior.max_entries);
+    }
+
+    fn test_state() -> AppState {
+        let mut config = crate::config::AppConfig::load().expect("test config loads");
+        config.security.rate_limit.requests_per_window = 10_000;
+        config.behavior.enabled = true;
+        config.behavior.object_enumeration_threshold = 3;
+        config.behavior.object_window_secs = 60;
+        config.behavior.auth_bruteforce_threshold = 4;
+        config.behavior.password_spray_threshold = 3;
+        config.behavior.auth_attempt_window_secs = 60;
+        config.behavior.max_entries = 3;
+        config.behavior.max_ids_per_entry = 4;
+        config.storage.sqlite_path = format!(
+            "{}/uzyntra-rate-test-{}.db",
+            std::env::temp_dir().display(),
+            uuid::Uuid::new_v4()
+        );
+        app::build_state(config).expect("test state builds")
+    }
+
+    fn context(path: &str, method: &str) -> RequestContext {
+        RequestContext {
+            request_id: "request-1".to_string(),
+            timestamp: chrono::Utc::now(),
+            source_ip: IpAddr::from_str("203.0.113.10").unwrap(),
+            method: method.to_string(),
+            path: path.to_string(),
+            query: None,
+            body_preview: None,
+            parsed_body_fields: Vec::new(),
+            auth_status: AuthStatus::NotRequired,
+        }
+    }
+
+    fn login_context(email: &str) -> RequestContext {
+        let mut context = context("/login", "POST");
+        context.parsed_body_fields = vec![
+            ParsedBodyField {
+                key: "email".to_string(),
+                value_preview: email.to_string(),
+            },
+            ParsedBodyField {
+                key: "password".to_string(),
+                value_preview: "[redacted]".to_string(),
+            },
+        ];
+        context
+    }
 }

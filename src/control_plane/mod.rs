@@ -13,7 +13,7 @@ use crate::{
     config::{RoutePolicyOverride, RouteRateLimitOverride},
     core, mitigation, storage,
     types::{
-        ok, err, AdminAudit, AppState, DeleteRouteOverrideRequest, DeleteRouteRateLimitRequest,
+        err, ok, AdminAudit, AppState, DeleteRouteOverrideRequest, DeleteRouteRateLimitRequest,
         EventSearchFilters, SetGlobalRuleModeRequest, UpsertRouteOverrideRequest,
         UpsertRouteRateLimitRequest,
     },
@@ -87,9 +87,14 @@ pub async fn get_config(State(state): State<AppState>) -> Json<Value> {
 pub async fn effective_policy(State(state): State<AppState>) -> Json<Value> {
     let guard = state.policy_state.read().expect("policy_state poisoned");
     Json(json!(ok(json!({
+        "version": guard.version,
+        "previous_version": guard.previous_version,
+        "policy_mode": guard.policy_mode,
         "global_rule_modes": guard.global_rule_modes,
         "route_overrides": guard.route_overrides,
-        "route_rate_limits": guard.route_rate_limits
+        "route_rate_limits": guard.route_rate_limits,
+        "route_behavior_overrides": guard.route_behavior_overrides,
+        "detector_exceptions": guard.detector_exceptions
     }))))
 }
 
@@ -102,7 +107,10 @@ pub async fn set_global_rule_mode(
 
     {
         let mut guard = state.policy_state.write().expect("policy_state poisoned");
-        guard.global_rule_modes.insert(body.rule_id.clone(), body.mode.clone());
+        guard
+            .global_rule_modes
+            .insert(body.rule_id.clone(), body.mode.clone());
+        bump_policy_version(&mut guard);
     }
 
     audit(
@@ -141,6 +149,7 @@ pub async fn upsert_route_override(
                 rule_modes: body.rule_modes.clone(),
             });
         }
+        bump_policy_version(&mut guard);
     }
 
     audit(
@@ -164,8 +173,14 @@ pub async fn delete_route_override(
     let removed = {
         let mut guard = state.policy_state.write().expect("policy_state poisoned");
         let before = guard.route_overrides.len();
-        guard.route_overrides.retain(|r| r.path_prefix != body.path_prefix);
-        before != guard.route_overrides.len()
+        guard
+            .route_overrides
+            .retain(|r| r.path_prefix != body.path_prefix);
+        let removed = before != guard.route_overrides.len();
+        if removed {
+            bump_policy_version(&mut guard);
+        }
+        removed
     };
 
     audit(
@@ -206,6 +221,7 @@ pub async fn upsert_route_rate_limit(
                 window_secs: body.window_secs,
             });
         }
+        bump_policy_version(&mut guard);
     }
 
     audit(
@@ -232,8 +248,14 @@ pub async fn delete_route_rate_limit(
     let removed = {
         let mut guard = state.policy_state.write().expect("policy_state poisoned");
         let before = guard.route_rate_limits.len();
-        guard.route_rate_limits.retain(|r| r.path_prefix != body.path_prefix);
-        before != guard.route_rate_limits.len()
+        guard
+            .route_rate_limits
+            .retain(|r| r.path_prefix != body.path_prefix);
+        let removed = before != guard.route_rate_limits.len();
+        if removed {
+            bump_policy_version(&mut guard);
+        }
+        removed
     };
 
     audit(
@@ -343,10 +365,7 @@ pub async fn list_reputations(State(state): State<AppState>) -> Json<Value> {
     }))))
 }
 
-pub async fn get_reputation(
-    State(state): State<AppState>,
-    Path(ip): Path<String>,
-) -> Json<Value> {
+pub async fn get_reputation(State(state): State<AppState>, Path(ip): Path<String>) -> Json<Value> {
     match ip.parse::<IpAddr>() {
         Ok(parsed) => {
             let rep = state.mitigation_store.get_reputation(parsed);
@@ -368,9 +387,10 @@ pub async fn unblock_ip(
             let removed = state.mitigation_store.unblock_ip(parsed);
 
             if removed {
-                if let Err(e) =
-                    storage::delete_active_mitigation(&state.config.storage.sqlite_path, &parsed.to_string())
-                {
+                if let Err(e) = storage::delete_active_mitigation(
+                    &state.config.storage.sqlite_path,
+                    &parsed.to_string(),
+                ) {
                     tracing::error!(error = %e, "failed to delete active mitigation from SQLite");
                 }
             }
@@ -608,8 +628,14 @@ pub async fn save_policy_bundle(
 
     match storage::save_policy_bundle(&state.config.storage.sqlite_path, &bundle) {
         Ok(()) => {
-            audit(&state, actor, "save_policy_bundle", bundle.bundle_id.clone(), "created",
-                format!("signed policy bundle saved; digest={digest}"));
+            audit(
+                &state,
+                actor,
+                "save_policy_bundle",
+                bundle.bundle_id.clone(),
+                "created",
+                format!("signed policy bundle saved; digest={digest}"),
+            );
             Json(json!(ok(json!({
                 "bundle_id": bundle.bundle_id,
                 "created_at": bundle.created_at,
@@ -644,7 +670,8 @@ pub async fn restore_policy_bundle(
                 let refusal_count = storage::count_restore_refusals_for_bundle(
                     &state.config.storage.sqlite_path,
                     &bundle.bundle_id,
-                ).unwrap_or(1);
+                )
+                .unwrap_or(1);
                 let alert = crate::types::RestoreRefusalAlert {
                     alert_id: format!("alert-{}", uuid::Uuid::new_v4()),
                     created_at: chrono::Utc::now(),
@@ -656,7 +683,10 @@ pub async fn restore_policy_bundle(
                     recomputed_digest_sha256: recomputed,
                     latest_actor: actor.clone(),
                 };
-                let _ = storage::upsert_restore_refusal_alert(&state.config.storage.sqlite_path, &alert);
+                let _ = storage::upsert_restore_refusal_alert(
+                    &state.config.storage.sqlite_path,
+                    &alert,
+                );
                 audit(
                     &state,
                     actor,
@@ -667,15 +697,51 @@ pub async fn restore_policy_bundle(
                 );
                 return Json(json!(err::<Value>("policy bundle digest mismatch")));
             }
+            let import = crate::types::LivePolicyImportRequest {
+                policy_mode: Some(bundle.live_policy.policy_mode.clone()),
+                global_rule_modes: bundle.live_policy.global_rule_modes.clone(),
+                route_overrides: bundle.live_policy.route_overrides.clone(),
+                route_rate_limits: bundle.live_policy.route_rate_limits.clone(),
+                route_behavior_overrides: bundle.live_policy.route_behavior_overrides.clone(),
+                detector_exceptions: bundle.live_policy.detector_exceptions.clone(),
+            };
+            if let Err(error) = crate::core::validate_live_policy_import(&import) {
+                audit(
+                    &state,
+                    actor,
+                    "restore_policy_bundle",
+                    body.bundle_id,
+                    "rejected",
+                    format!("policy bundle restore rejected by validation: {error}"),
+                );
+                return Json(json!(err::<Value>(format!(
+                    "policy bundle validation failed: {error}"
+                ))));
+            }
             {
                 let mut guard = state.policy_state.write().expect("policy_state poisoned");
+                guard.previous_version = Some(guard.version);
+                guard.version = guard.version.saturating_add(1);
+                guard.updated_at = Some(chrono::Utc::now());
+                guard.policy_mode = bundle.live_policy.policy_mode.clone();
                 guard.global_rule_modes = bundle.live_policy.global_rule_modes.clone();
                 guard.route_overrides = bundle.live_policy.route_overrides.clone();
                 guard.route_rate_limits = bundle.live_policy.route_rate_limits.clone();
-                guard.route_behavior_overrides = bundle.live_policy.route_behavior_overrides.clone();
+                guard.route_behavior_overrides =
+                    bundle.live_policy.route_behavior_overrides.clone();
+                guard.detector_exceptions = bundle.live_policy.detector_exceptions.clone();
             }
-            audit(&state, actor, "restore_policy_bundle", body.bundle_id, "updated",
-                format!("signed policy bundle restored; digest={}", bundle.digest_sha256));
+            audit(
+                &state,
+                actor,
+                "restore_policy_bundle",
+                body.bundle_id,
+                "updated",
+                format!(
+                    "signed policy bundle restored; digest={}",
+                    bundle.digest_sha256
+                ),
+            );
             Json(json!(ok(bundle)))
         }
         Ok(None) => Json(json!(err::<Value>("policy bundle not found"))),
@@ -699,10 +765,12 @@ pub async fn latest_policy_diff(State(state): State<AppState>) -> Json<Value> {
                     compared_at: chrono::Utc::now(),
                     bundle_id: None,
                     has_changes: false,
+                    policy_mode_changed: false,
                     global_rule_modes_changed: false,
                     route_overrides_changed: false,
                     route_rate_limits_changed: false,
                     route_behavior_overrides_changed: false,
+                    detector_exceptions_changed: false,
                 })))
             }
         }
@@ -733,9 +801,17 @@ pub async fn upsert_tri_scoped_allowlist(
     };
     match storage::upsert_tri_scoped_allowlist(&state.config.storage.sqlite_path, &item) {
         Ok(()) => {
-            audit(&state, actor, "upsert_tri_scoped_allowlist",
-                format!("{} {} {}", item.source_ip, item.principal_prefix, item.path_prefix),
-                "updated", "tri-scoped allowlist entry upserted".to_string());
+            audit(
+                &state,
+                actor,
+                "upsert_tri_scoped_allowlist",
+                format!(
+                    "{} {} {}",
+                    item.source_ip, item.principal_prefix, item.path_prefix
+                ),
+                "updated",
+                "tri-scoped allowlist entry upserted".to_string(),
+            );
             Json(json!(ok(item)))
         }
         Err(e) => Json(json!(err::<Value>(e.to_string()))),
@@ -750,13 +826,22 @@ pub async fn delete_tri_scoped_allowlist(
     let actor = actor_from_headers(&headers);
     match storage::delete_tri_scoped_allowlist(
         &state.config.storage.sqlite_path,
-        &body.source_ip, &body.principal_prefix, &body.path_prefix,
+        &body.source_ip,
+        &body.principal_prefix,
+        &body.path_prefix,
     ) {
         Ok(removed) => {
-            audit(&state, actor, "delete_tri_scoped_allowlist",
-                format!("{} {} {}", body.source_ip, body.principal_prefix, body.path_prefix),
+            audit(
+                &state,
+                actor,
+                "delete_tri_scoped_allowlist",
+                format!(
+                    "{} {} {}",
+                    body.source_ip, body.principal_prefix, body.path_prefix
+                ),
                 if removed { "removed" } else { "not_found" },
-                "tri-scoped allowlist entry delete attempted".to_string());
+                "tri-scoped allowlist entry delete attempted".to_string(),
+            );
             Json(json!(ok(json!({
                 "removed": removed,
                 "source_ip": body.source_ip,
@@ -858,7 +943,10 @@ pub async fn approve_response_contract_from_event(
                     body.note.clone(),
                 ) {
                     Some(contract) => {
-                        match storage::upsert_response_contract(&state.config.storage.sqlite_path, &contract) {
+                        match storage::upsert_response_contract(
+                            &state.config.storage.sqlite_path,
+                            &contract,
+                        ) {
                             Ok(()) => {
                                 audit(
                                     &state,
@@ -866,14 +954,17 @@ pub async fn approve_response_contract_from_event(
                                     "approve_response_contract_from_event",
                                     body.request_id,
                                     "updated",
-                                    "response contract approved from recent mismatch event".to_string(),
+                                    "response contract approved from recent mismatch event"
+                                        .to_string(),
                                 );
                                 Json(json!(ok(contract)))
                             }
                             Err(e) => Json(json!(err::<Value>(e.to_string()))),
                         }
                     }
-                    None => Json(json!(err::<Value>("event is not a response.contract_mismatch"))),
+                    None => Json(json!(err::<Value>(
+                        "event is not a response.contract_mismatch"
+                    ))),
                 }
             } else {
                 Json(json!(err::<Value>("request_id not found")))
@@ -916,8 +1007,14 @@ pub async fn acknowledge_restore_refusal_alert(
         &actor,
     ) {
         Ok(true) => {
-            audit(&state, actor, "acknowledge_restore_refusal_alert", body.alert_id,
-                "updated", "restore refusal alert acknowledged".to_string());
+            audit(
+                &state,
+                actor,
+                "acknowledge_restore_refusal_alert",
+                body.alert_id,
+                "updated",
+                "restore refusal alert acknowledged".to_string(),
+            );
             Json(json!(ok(json!({"acknowledged": true}))))
         }
         Ok(false) => Json(json!(err::<Value>("restore refusal alert not found"))),
@@ -938,8 +1035,14 @@ pub async fn resolve_restore_refusal_alert(
         &actor,
     ) {
         Ok(true) => {
-            audit(&state, actor, "resolve_restore_refusal_alert", body.alert_id,
-                "updated", "restore refusal alert resolved".to_string());
+            audit(
+                &state,
+                actor,
+                "resolve_restore_refusal_alert",
+                body.alert_id,
+                "updated",
+                "restore refusal alert resolved".to_string(),
+            );
             Json(json!(ok(json!({"resolved": true}))))
         }
         Ok(false) => Json(json!(err::<Value>("restore refusal alert not found"))),
@@ -967,12 +1070,16 @@ pub async fn promote_managed_spec_release(
         ))));
     }
 
-    let current_items = storage::query_managed_spec_release_state(&state.config.storage.sqlite_path)
-        .unwrap_or_default();
-    let current = current_items.iter().find(|item| {
-        item.method.eq_ignore_ascii_case(&body.method)
-            && item.normalized_path == body.normalized_path
-    }).map(|item| item.channel.as_str());
+    let current_items =
+        storage::query_managed_spec_release_state(&state.config.storage.sqlite_path)
+            .unwrap_or_default();
+    let current = current_items
+        .iter()
+        .find(|item| {
+            item.method.eq_ignore_ascii_case(&body.method)
+                && item.normalized_path == body.normalized_path
+        })
+        .map(|item| item.channel.as_str());
 
     if !crate::core::is_valid_release_transition(current, &body.target_channel) {
         return Json(json!(err::<Value>("invalid release-state transition")));
@@ -989,9 +1096,14 @@ pub async fn promote_managed_spec_release(
 
     match storage::upsert_managed_spec_release_state(&state.config.storage.sqlite_path, &next) {
         Ok(()) => {
-            audit(&state, actor, "promote_managed_spec_release",
+            audit(
+                &state,
+                actor,
+                "promote_managed_spec_release",
                 format!("{} {}", next.method, next.normalized_path),
-                "updated", format!("release channel moved to {}", next.channel));
+                "updated",
+                format!("release channel moved to {}", next.channel),
+            );
             Json(json!(ok(next)))
         }
         Err(e) => Json(json!(err::<Value>(e.to_string()))),
@@ -1007,11 +1119,15 @@ pub async fn export_envoy_inventory(State(state): State<AppState>) -> Json<Value
 }
 
 pub async fn contract_recommendations(State(state): State<AppState>) -> Json<Value> {
-    Json(json!(ok(crate::core::build_contract_recommendations(&state))))
+    Json(json!(ok(crate::core::build_contract_recommendations(
+        &state
+    ))))
 }
 
 pub async fn export_api_gateway_policy(State(state): State<AppState>) -> Json<Value> {
-    Json(json!(ok(crate::core::export_api_gateway_policy_inventory(&state))))
+    Json(json!(ok(crate::core::export_api_gateway_policy_inventory(
+        &state
+    ))))
 }
 
 pub async fn export_manifest(State(state): State<AppState>) -> Json<Value> {
@@ -1069,9 +1185,14 @@ pub async fn upsert_managed_spec_release_state(
     };
     match storage::upsert_managed_spec_release_state(&state.config.storage.sqlite_path, &item) {
         Ok(()) => {
-            audit(&state, actor, "upsert_managed_spec_release_state",
+            audit(
+                &state,
+                actor,
+                "upsert_managed_spec_release_state",
                 format!("{} {}", item.method, item.normalized_path),
-                "updated", format!("release channel set to {}", item.channel));
+                "updated",
+                format!("release channel set to {}", item.channel),
+            );
             Json(json!(ok(item)))
         }
         Err(e) => Json(json!(err::<Value>(e.to_string()))),
@@ -1090,10 +1211,14 @@ pub async fn delete_managed_spec_release_state(
         &body.normalized_path,
     ) {
         Ok(removed) => {
-            audit(&state, actor, "delete_managed_spec_release_state",
+            audit(
+                &state,
+                actor,
+                "delete_managed_spec_release_state",
                 format!("{} {}", body.method, body.normalized_path),
                 if removed { "removed" } else { "not_found" },
-                "managed spec release state delete attempted".to_string());
+                "managed spec release state delete attempted".to_string(),
+            );
             Json(json!(ok(json!({
                 "removed": removed,
                 "method": body.method.to_ascii_uppercase(),
@@ -1109,9 +1234,15 @@ pub async fn export_gateway_variant(
     Query(req): Query<crate::types::GatewayExportVariantRequest>,
 ) -> Json<Value> {
     match req.variant.as_str() {
-        "gateway-routing-only" => Json(json!(ok(crate::core::export_gateway_routing_only_inventory(&state)))),
-        "gateway-enforcement" => Json(json!(ok(crate::core::export_gateway_enforcement_inventory(&state)))),
-        _ => Json(json!(ok(crate::core::export_gateway_managed_spec_inventory(&state)))),
+        "gateway-routing-only" => Json(json!(ok(
+            crate::core::export_gateway_routing_only_inventory(&state)
+        ))),
+        "gateway-enforcement" => Json(json!(ok(
+            crate::core::export_gateway_enforcement_inventory(&state)
+        ))),
+        _ => Json(json!(ok(
+            crate::core::export_gateway_managed_spec_inventory(&state)
+        ))),
     }
 }
 
@@ -1126,11 +1257,17 @@ pub async fn policy_timeline(State(state): State<AppState>) -> Json<Value> {
 }
 
 pub async fn export_gateway_managed_spec_inventory(State(state): State<AppState>) -> Json<Value> {
-    Json(json!(ok(crate::core::export_gateway_managed_spec_inventory(&state))))
+    Json(json!(ok(
+        crate::core::export_gateway_managed_spec_inventory(&state)
+    )))
 }
 
-pub async fn export_enforcement_managed_spec_inventory(State(state): State<AppState>) -> Json<Value> {
-    Json(json!(ok(crate::core::export_enforcement_managed_spec_inventory(&state))))
+pub async fn export_enforcement_managed_spec_inventory(
+    State(state): State<AppState>,
+) -> Json<Value> {
+    Json(json!(ok(
+        crate::core::export_enforcement_managed_spec_inventory(&state)
+    )))
 }
 
 pub async fn approve_response_contract(
@@ -1142,9 +1279,14 @@ pub async fn approve_response_contract(
     let contract = crate::core::build_response_contract_from_request(actor.clone(), body);
     match storage::upsert_response_contract(&state.config.storage.sqlite_path, &contract) {
         Ok(()) => {
-            audit(&state, actor, "approve_response_contract",
+            audit(
+                &state,
+                actor,
+                "approve_response_contract",
                 format!("{} {}", contract.method, contract.normalized_path),
-                "updated", "response contract approved from analyst shortcut".to_string());
+                "updated",
+                "response contract approved from analyst shortcut".to_string(),
+            );
             Json(json!(ok(contract)))
         }
         Err(e) => Json(json!(err::<Value>(e.to_string()))),
@@ -1173,9 +1315,14 @@ pub async fn upsert_scoped_source_allowlist(
     };
     match storage::upsert_scoped_source_allowlist(&state.config.storage.sqlite_path, &item) {
         Ok(()) => {
-            audit(&state, actor, "upsert_scoped_source_allowlist",
-                format!("{} {}", item.source_ip, item.path_prefix), "updated",
-                "scoped source allowlist entry upserted".to_string());
+            audit(
+                &state,
+                actor,
+                "upsert_scoped_source_allowlist",
+                format!("{} {}", item.source_ip, item.path_prefix),
+                "updated",
+                "scoped source allowlist entry upserted".to_string(),
+            );
             Json(json!(ok(item)))
         }
         Err(e) => Json(json!(err::<Value>(e.to_string()))),
@@ -1188,13 +1335,23 @@ pub async fn delete_scoped_source_allowlist(
     Json(body): Json<crate::types::DeleteScopedSourceAllowlistRequest>,
 ) -> Json<Value> {
     let actor = actor_from_headers(&headers);
-    match storage::delete_scoped_source_allowlist(&state.config.storage.sqlite_path, &body.source_ip, &body.path_prefix) {
+    match storage::delete_scoped_source_allowlist(
+        &state.config.storage.sqlite_path,
+        &body.source_ip,
+        &body.path_prefix,
+    ) {
         Ok(removed) => {
-            audit(&state, actor, "delete_scoped_source_allowlist",
+            audit(
+                &state,
+                actor,
+                "delete_scoped_source_allowlist",
                 format!("{} {}", body.source_ip, body.path_prefix),
                 if removed { "removed" } else { "not_found" },
-                "scoped source allowlist entry delete attempted".to_string());
-            Json(json!(ok(json!({ "removed": removed, "source_ip": body.source_ip, "path_prefix": body.path_prefix }))))
+                "scoped source allowlist entry delete attempted".to_string(),
+            );
+            Json(json!(ok(
+                json!({ "removed": removed, "source_ip": body.source_ip, "path_prefix": body.path_prefix })
+            )))
         }
         Err(e) => Json(json!(err::<Value>(e.to_string()))),
     }
@@ -1222,9 +1379,14 @@ pub async fn upsert_scoped_principal_allowlist(
     };
     match storage::upsert_scoped_principal_allowlist(&state.config.storage.sqlite_path, &item) {
         Ok(()) => {
-            audit(&state, actor, "upsert_scoped_principal_allowlist",
-                format!("{} {}", item.principal_prefix, item.path_prefix), "updated",
-                "scoped principal allowlist entry upserted".to_string());
+            audit(
+                &state,
+                actor,
+                "upsert_scoped_principal_allowlist",
+                format!("{} {}", item.principal_prefix, item.path_prefix),
+                "updated",
+                "scoped principal allowlist entry upserted".to_string(),
+            );
             Json(json!(ok(item)))
         }
         Err(e) => Json(json!(err::<Value>(e.to_string()))),
@@ -1237,20 +1399,32 @@ pub async fn delete_scoped_principal_allowlist(
     Json(body): Json<crate::types::DeleteScopedPrincipalAllowlistRequest>,
 ) -> Json<Value> {
     let actor = actor_from_headers(&headers);
-    match storage::delete_scoped_principal_allowlist(&state.config.storage.sqlite_path, &body.principal_prefix, &body.path_prefix) {
+    match storage::delete_scoped_principal_allowlist(
+        &state.config.storage.sqlite_path,
+        &body.principal_prefix,
+        &body.path_prefix,
+    ) {
         Ok(removed) => {
-            audit(&state, actor, "delete_scoped_principal_allowlist",
+            audit(
+                &state,
+                actor,
+                "delete_scoped_principal_allowlist",
                 format!("{} {}", body.principal_prefix, body.path_prefix),
                 if removed { "removed" } else { "not_found" },
-                "scoped principal allowlist entry delete attempted".to_string());
-            Json(json!(ok(json!({ "removed": removed, "principal_prefix": body.principal_prefix, "path_prefix": body.path_prefix }))))
+                "scoped principal allowlist entry delete attempted".to_string(),
+            );
+            Json(json!(ok(
+                json!({ "removed": removed, "principal_prefix": body.principal_prefix, "path_prefix": body.path_prefix })
+            )))
         }
         Err(e) => Json(json!(err::<Value>(e.to_string()))),
     }
 }
 
 pub async fn export_managed_spec_inventory(State(state): State<AppState>) -> Json<Value> {
-    Json(json!(ok(crate::core::export_managed_spec_inventory(&state))))
+    Json(json!(ok(crate::core::export_managed_spec_inventory(
+        &state
+    ))))
 }
 
 pub async fn source_allowlist(State(state): State<AppState>) -> Json<Value> {
@@ -1403,12 +1577,31 @@ pub async fn import_live_policy(
 ) -> Json<Value> {
     let actor = actor_from_headers(&headers);
 
+    if let Err(error) = crate::core::validate_live_policy_import(&body) {
+        audit(
+            &state,
+            actor,
+            "import_live_policy",
+            "policy_state".to_string(),
+            "rejected",
+            format!("validation_error={error}"),
+        );
+        return Json(json!(err::<Value>(format!(
+            "policy validation failed: {error}"
+        ))));
+    }
+
     {
         let mut guard = state.policy_state.write().expect("policy_state poisoned");
+        bump_policy_version(&mut guard);
+        if let Some(policy_mode) = body.policy_mode.clone() {
+            guard.policy_mode = policy_mode;
+        }
         guard.global_rule_modes = body.global_rule_modes.clone();
         guard.route_overrides = body.route_overrides.clone();
         guard.route_rate_limits = body.route_rate_limits.clone();
         guard.route_behavior_overrides = body.route_behavior_overrides.clone();
+        guard.detector_exceptions = body.detector_exceptions.clone();
     }
 
     audit(
@@ -1608,13 +1801,16 @@ pub async fn upsert_route_behavior_override(
             existing.object_enumeration_threshold = body.object_enumeration_threshold;
             existing.object_window_secs = body.object_window_secs;
         } else {
-            guard.route_behavior_overrides.push(crate::config::RouteBehaviorOverride {
-                path_prefix: body.path_prefix.clone(),
-                warmup_min_samples: body.warmup_min_samples,
-                object_enumeration_threshold: body.object_enumeration_threshold,
-                object_window_secs: body.object_window_secs,
-            });
+            guard
+                .route_behavior_overrides
+                .push(crate::config::RouteBehaviorOverride {
+                    path_prefix: body.path_prefix.clone(),
+                    warmup_min_samples: body.warmup_min_samples,
+                    object_enumeration_threshold: body.object_enumeration_threshold,
+                    object_window_secs: body.object_window_secs,
+                });
         }
+        bump_policy_version(&mut guard);
     }
 
     audit(
@@ -1639,8 +1835,14 @@ pub async fn delete_route_behavior_override(
     let removed = {
         let mut guard = state.policy_state.write().expect("policy_state poisoned");
         let before = guard.route_behavior_overrides.len();
-        guard.route_behavior_overrides.retain(|r| r.path_prefix != body.path_prefix);
-        before != guard.route_behavior_overrides.len()
+        guard
+            .route_behavior_overrides
+            .retain(|r| r.path_prefix != body.path_prefix);
+        let removed = before != guard.route_behavior_overrides.len();
+        if removed {
+            bump_policy_version(&mut guard);
+        }
+        removed
     };
 
     audit(
@@ -1890,10 +2092,7 @@ pub async fn clear_behavior_baselines(
     }))))
 }
 
-pub async fn clear_shadow_routes(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Json<Value> {
+pub async fn clear_shadow_routes(State(state): State<AppState>, headers: HeaderMap) -> Json<Value> {
     let actor = actor_from_headers(&headers);
 
     let memory_removed = core::clear_learned_routes();
@@ -1939,10 +2138,7 @@ pub async fn persisted_shadow_routes(State(state): State<AppState>) -> Json<Valu
     }
 }
 
-pub async fn sync_shadow_routes(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Json<Value> {
+pub async fn sync_shadow_routes(State(state): State<AppState>, headers: HeaderMap) -> Json<Value> {
     let actor = actor_from_headers(&headers);
 
     match core::sync_learned_routes_to_storage(&state, &state.config.storage.sqlite_path) {
@@ -2098,4 +2294,10 @@ fn audit(
     if let Err(e) = storage::persist_admin_audit(&state.config.storage.sqlite_path, &audit) {
         tracing::error!(error = %e, "failed to persist admin audit");
     }
+}
+
+fn bump_policy_version(policy: &mut crate::types::LivePolicyState) {
+    policy.previous_version = Some(policy.version);
+    policy.version = policy.version.saturating_add(1);
+    policy.updated_at = Some(chrono::Utc::now());
 }

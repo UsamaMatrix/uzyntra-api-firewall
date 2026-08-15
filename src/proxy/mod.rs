@@ -6,8 +6,7 @@ use axum::{
 use tracing::{error, info};
 
 use crate::{
-    detection, policy, rate_limit, storage, telemetry,
-    mitigation,
+    detection, mitigation, policy, rate_limit, storage, telemetry,
     types::{
         AppState, AttackClass, Finding, FindingEvidence, RequestContext, SecurityEvent, Severity,
     },
@@ -27,16 +26,18 @@ pub async fn proxy_handler(
     let headers = request.headers().clone();
 
     let mut request_findings = detection::inspect_request(&state, &context, &headers);
-request_findings.extend(rate_limit::evaluate_request_with_headers(
-    &state,
-    &context,
-    &headers,
-));
+    request_findings.extend(rate_limit::evaluate_request_with_headers(
+        &state, &context, &headers,
+    ));
 
-    let principal_key = crate::core::derive_principal(&state, &context, &headers)
-        .as_rate_limit_key();
+    let principal_key =
+        crate::core::derive_principal(&state, &context, &headers).as_rate_limit_key();
     let trusted_source = crate::core::is_source_allowlisted(&state, &context.source_ip.to_string())
-        || crate::core::is_source_allowlisted_for_path(&state, &context.source_ip.to_string(), &context.path);
+        || crate::core::is_source_allowlisted_for_path(
+            &state,
+            &context.source_ip.to_string(),
+            &context.path,
+        );
     let trusted_principal = crate::core::is_principal_allowlisted(&state, &principal_key)
         || crate::core::is_principal_allowlisted_for_path(&state, &principal_key, &context.path);
 
@@ -61,17 +62,20 @@ request_findings.extend(rate_limit::evaluate_request_with_headers(
     }
 
     let shadow_routes = crate::core::discover_shadow_apis(&state);
-    if shadow_routes
-        .iter()
-        .any(|r| r.method.eq_ignore_ascii_case(&context.method) && r.normalized_path
-    == crate::core::normalize_runtime_path(&crate::core::canonical_security_path(&context.path)))
-    {
+    if shadow_routes.iter().any(|r| {
+        r.method.eq_ignore_ascii_case(&context.method)
+            && r.normalized_path
+                == crate::core::normalize_runtime_path(&crate::core::canonical_security_path(
+                    &context.path,
+                ))
+    }) {
         request_findings.push(Finding {
             rule_id: "shadow.route_live".to_string(),
             attack_class: AttackClass::ShadowApi,
             severity: Severity::Medium,
             confidence: 0.80,
-            message: "request matched a learned live route that is outside the configured spec".to_string(),
+            message: "request matched a learned live route that is outside the configured spec"
+                .to_string(),
             evidence: vec![FindingEvidence {
                 location: "request.path".to_string(),
                 value_preview: context.path.clone(),
@@ -95,13 +99,17 @@ request_findings.extend(rate_limit::evaluate_request_with_headers(
             source_ip: context.source_ip.to_string(),
             method: context.method.clone(),
             path: context.path.clone(),
+            normalized_route: Some(crate::core::normalize_runtime_path(
+                &crate::core::canonical_security_path(&context.path),
+            )),
             findings: request_findings,
             decision: decision.clone(),
         };
 
         telemetry::emit_security_event(&event, &state.config.telemetry.security_event_log_path);
 
-        if let Err(err) = storage::persist_security_event(&state.config.storage.sqlite_path, &event) {
+        if let Err(err) = storage::persist_security_event(&state.config.storage.sqlite_path, &event)
+        {
             error!(error = %err, "failed to persist request-side security event to SQLite");
         }
 
@@ -172,9 +180,27 @@ request_findings.extend(rate_limit::evaluate_request_with_headers(
         Ok(bytes) => bytes,
         Err(err) => {
             error!(error = %err, "failed to read upstream response body");
-            return response_with_status(StatusCode::BAD_GATEWAY, "failed to read upstream response");
+            return response_with_status(
+                StatusCode::BAD_GATEWAY,
+                "failed to read upstream response",
+            );
         }
     };
+
+    let normalized_path =
+        crate::core::normalize_runtime_path(&crate::core::canonical_security_path(&context.path));
+    let response_content_type = response_headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(ToOwned::to_owned);
+    crate::core::observe_route_response(
+        &state,
+        &context.method,
+        &normalized_path,
+        status.as_u16(),
+        response_content_type.as_deref(),
+        response_body.len(),
+    );
 
     let preview_len = state
         .config
@@ -183,8 +209,7 @@ request_findings.extend(rate_limit::evaluate_request_with_headers(
         .min(response_body.len());
     let response_body_preview = String::from_utf8_lossy(&response_body[..preview_len]).to_string();
 
-    let mut response_findings =
-        inspect_response_headers(&response_headers, &state, Some(&context));
+    let mut response_findings = inspect_response_headers(&response_headers, &state, Some(&context));
 
     response_findings.extend(detection::inspect_response(
         &state,
@@ -193,15 +218,9 @@ request_findings.extend(rate_limit::evaluate_request_with_headers(
         &response_body_preview,
     ));
 
-    let normalized_path = crate::core::normalize_runtime_path(
-        &crate::core::canonical_security_path(&context.path)
-    );
-
-    if let Some(contract) = crate::core::response_contract_for_route(
-        &state,
-        &context.method,
-        &normalized_path,
-    ) {
+    if let Some(contract) =
+        crate::core::response_contract_for_route(&state, &context.method, &normalized_path)
+    {
         let status_ok = status.as_u16() == contract.expected_status;
 
         let content_type_value = response_headers
@@ -209,7 +228,8 @@ request_findings.extend(rate_limit::evaluate_request_with_headers(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
-        let content_type_ok = content_type_value.starts_with(&contract.expected_content_type_prefix);
+        let content_type_ok =
+            content_type_value.starts_with(&contract.expected_content_type_prefix);
 
         let missing_required_headers: Vec<String> = contract
             .required_headers
@@ -241,8 +261,7 @@ request_findings.extend(rate_limit::evaluate_request_with_headers(
                         location: "response.contract.content_type".to_string(),
                         value_preview: format!(
                             "expected_prefix={}, actual={}",
-                            contract.expected_content_type_prefix,
-                            content_type_value
+                            contract.expected_content_type_prefix, content_type_value
                         ),
                     },
                     crate::types::FindingEvidence {
@@ -273,13 +292,15 @@ request_findings.extend(rate_limit::evaluate_request_with_headers(
             source_ip: context.source_ip.to_string(),
             method: context.method.clone(),
             path: context.path.clone(),
+            normalized_route: Some(normalized_path.clone()),
             findings: response_findings,
             decision: decision.clone(),
         };
 
         telemetry::emit_security_event(&event, &state.config.telemetry.security_event_log_path);
 
-        if let Err(err) = storage::persist_security_event(&state.config.storage.sqlite_path, &event) {
+        if let Err(err) = storage::persist_security_event(&state.config.storage.sqlite_path, &event)
+        {
             error!(error = %err, "failed to persist response-side security event to SQLite");
         }
 
@@ -357,6 +378,65 @@ fn inspect_response_headers(
                 mode: crate::types::resolve_rule_mode(state, path, rule_id),
             });
         }
+    }
+
+    let path = context.map(|c| c.path.as_str()).unwrap_or("/proxy");
+    let allow_origin = headers
+        .get("access-control-allow-origin")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let allow_credentials = headers
+        .get("access-control-allow-credentials")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if allow_origin == "*" && allow_credentials.eq_ignore_ascii_case("true") {
+        findings.push(Finding {
+            rule_id: "UZ-RESP-CONFIG-001".to_string(),
+            attack_class: AttackClass::SecurityMisconfiguration,
+            severity: Severity::Medium,
+            confidence: 0.90,
+            message: "response exposes permissive CORS with credentials".to_string(),
+            evidence: vec![FindingEvidence {
+                location: "response.headers".into(),
+                value_preview:
+                    "access-control-allow-origin=*; access-control-allow-credentials=true"
+                        .to_string(),
+            }],
+            mode: crate::types::resolve_rule_mode(state, path, "UZ-RESP-CONFIG-001"),
+        });
+    }
+
+    let cache_control = headers
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if content_type.contains("json")
+        && !cache_control.contains("no-store")
+        && !cache_control.contains("private")
+        && (cache_control.contains("public") || cache_control.is_empty())
+    {
+        findings.push(Finding {
+            rule_id: "UZ-RESP-CONFIG-002".to_string(),
+            attack_class: AttackClass::SecurityMisconfiguration,
+            severity: Severity::Low,
+            confidence: 0.82,
+            message: "JSON API response may be cacheable by shared intermediaries".to_string(),
+            evidence: vec![FindingEvidence {
+                location: "response.headers.cache-control".into(),
+                value_preview: if cache_control.is_empty() {
+                    "missing".to_string()
+                } else {
+                    cache_control
+                },
+            }],
+            mode: crate::types::resolve_rule_mode(state, path, "UZ-RESP-CONFIG-002"),
+        });
     }
 
     findings

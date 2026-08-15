@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{
-        AppConfig, RouteBehaviorOverride, RoutePolicyOverride, RouteRateLimitOverride,
+        AppConfig, PolicyMode, RouteBehaviorOverride, RoutePolicyOverride, RouteRateLimitOverride,
         RouteSensitivity, RuleMode, SpecUnknownRouteMode,
     },
     mitigation::TemporaryMitigationStore,
@@ -31,21 +31,40 @@ pub struct AppState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LivePolicyState {
+    #[serde(default = "default_policy_version")]
+    pub version: u64,
+    #[serde(default)]
+    pub previous_version: Option<u64>,
+    #[serde(default)]
+    pub policy_mode: PolicyMode,
     pub global_rule_modes: HashMap<String, RuleMode>,
     pub route_overrides: Vec<RoutePolicyOverride>,
     pub route_rate_limits: Vec<RouteRateLimitOverride>,
     pub route_behavior_overrides: Vec<RouteBehaviorOverride>,
+    #[serde(default)]
+    pub detector_exceptions: Vec<crate::config::DetectorException>,
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 impl LivePolicyState {
     pub fn from_config(config: &AppConfig) -> Self {
         Self {
+            version: 1,
+            previous_version: None,
+            policy_mode: config.security.policy_mode.clone(),
             global_rule_modes: config.security.rule_modes.clone(),
             route_overrides: config.security.route_overrides.clone(),
             route_rate_limits: config.security.route_rate_limits.clone(),
             route_behavior_overrides: config.security.route_behavior_overrides.clone(),
+            detector_exceptions: config.security.detector_exceptions.clone(),
+            updated_at: Some(Utc::now()),
         }
     }
+}
+
+fn default_policy_version() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +116,10 @@ pub enum AttackClass {
     ResponseLeak,
     ShadowApi,
     TenantBoundaryViolation,
+    ApiInventory,
+    AuthAbuse,
+    ResourceAbuse,
+    SecurityMisconfiguration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,6 +145,52 @@ pub struct Finding {
     pub message: String,
     pub evidence: Vec<FindingEvidence>,
     pub mode: RuleMode,
+}
+
+impl Finding {
+    pub fn detector_id(&self) -> &str {
+        &self.rule_id
+    }
+
+    pub fn category(&self) -> &'static str {
+        match self.attack_class {
+            AttackClass::SqlInjection
+            | AttackClass::Xss
+            | AttackClass::CommandInjection
+            | AttackClass::PathTraversal => "injection",
+            AttackClass::Ssrf => "ssrf",
+            AttackClass::BrokenAuthentication | AttackClass::JwtAbuse | AttackClass::AuthAbuse => {
+                "authentication"
+            }
+            AttackClass::ObjectEnumeration | AttackClass::TenantBoundaryViolation => {
+                "object_access"
+            }
+            AttackClass::SchemaViolation => "schema",
+            AttackClass::ShadowApi | AttackClass::ApiInventory => "api_inventory",
+            AttackClass::BehaviorAnomaly
+            | AttackClass::RateLimitExceeded
+            | AttackClass::BruteForce => "behavior",
+            AttackClass::RequestSmuggling | AttackClass::HeaderInjection => "protocol",
+            AttackClass::MissingSecurityHeaders | AttackClass::SecurityMisconfiguration => {
+                "configuration"
+            }
+            AttackClass::ResponseLeak => "response_contract",
+            AttackClass::ResourceAbuse => "resource_consumption",
+            AttackClass::PayloadEvasion => "evasion",
+            AttackClass::MethodAbuse => "method_abuse",
+        }
+    }
+
+    pub fn score(&self) -> f32 {
+        let severity = match self.severity {
+            Severity::Low => 20.0,
+            Severity::Medium => 45.0,
+            Severity::High => 70.0,
+            Severity::Critical => 90.0,
+        };
+
+        (severity * self.confidence.clamp(0.0, 1.0)).clamp(0.0, 100.0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +241,8 @@ pub struct SecurityEvent {
     pub path: String,
     pub findings: Vec<Finding>,
     pub decision: SecurityDecision,
+    #[serde(default)]
+    pub normalized_route: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,6 +434,12 @@ pub struct EnrichedRequestContext {
     pub required_scopes: Vec<String>,
     pub schema_mode: SpecUnknownRouteMode,
     pub object_id_candidates: Vec<String>,
+    #[serde(default)]
+    pub learned_route_hits: u64,
+    #[serde(default)]
+    pub request_content_type: Option<String>,
+    #[serde(default)]
+    pub request_size_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -455,18 +532,30 @@ pub struct DeletePrincipalAllowlistRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LivePolicyExport {
     pub exported_at: DateTime<Utc>,
+    #[serde(default = "default_policy_version")]
+    pub version: u64,
+    #[serde(default)]
+    pub previous_version: Option<u64>,
+    #[serde(default)]
+    pub policy_mode: crate::config::PolicyMode,
     pub global_rule_modes: std::collections::HashMap<String, crate::config::RuleMode>,
     pub route_overrides: Vec<crate::config::RoutePolicyOverride>,
     pub route_rate_limits: Vec<crate::config::RouteRateLimitOverride>,
     pub route_behavior_overrides: Vec<crate::config::RouteBehaviorOverride>,
+    #[serde(default)]
+    pub detector_exceptions: Vec<crate::config::DetectorException>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LivePolicyImportRequest {
+    #[serde(default)]
+    pub policy_mode: Option<crate::config::PolicyMode>,
     pub global_rule_modes: std::collections::HashMap<String, crate::config::RuleMode>,
     pub route_overrides: Vec<crate::config::RoutePolicyOverride>,
     pub route_rate_limits: Vec<crate::config::RouteRateLimitOverride>,
     pub route_behavior_overrides: Vec<crate::config::RouteBehaviorOverride>,
+    #[serde(default)]
+    pub detector_exceptions: Vec<crate::config::DetectorException>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -744,10 +833,12 @@ pub struct PolicyDiffResult {
     pub compared_at: DateTime<Utc>,
     pub bundle_id: Option<String>,
     pub has_changes: bool,
+    pub policy_mode_changed: bool,
     pub global_rule_modes_changed: bool,
     pub route_overrides_changed: bool,
     pub route_rate_limits_changed: bool,
     pub route_behavior_overrides_changed: bool,
+    pub detector_exceptions_changed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1050,4 +1141,31 @@ pub struct LearnedRoute {
     pub last_seen: DateTime<Utc>,
     pub hits: u64,
     pub has_auth: bool,
+    #[serde(default)]
+    pub request_content_types: Vec<String>,
+    #[serde(default)]
+    pub response_content_types: Vec<String>,
+    #[serde(default)]
+    pub observed_status_codes: Vec<u16>,
+    #[serde(default)]
+    pub min_request_bytes: Option<usize>,
+    #[serde(default)]
+    pub max_request_bytes: Option<usize>,
+    #[serde(default)]
+    pub min_response_bytes: Option<usize>,
+    #[serde(default)]
+    pub max_response_bytes: Option<usize>,
+    #[serde(default)]
+    pub status: ApiInventoryStatus,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiInventoryStatus {
+    #[default]
+    New,
+    Known,
+    Approved,
+    Deprecated,
+    Unknown,
 }

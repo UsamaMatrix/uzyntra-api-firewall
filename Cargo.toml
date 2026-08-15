@@ -25,4 +25,9 @@ tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 urlencoding = "2"
+url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+[[bench]]
+name = "phase5_detection_hot_path"
+harness = false
